@@ -1,3 +1,8 @@
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+from config.settings import DATABASE_PATH
 import sqlite3
 import random
 from datetime import date, timedelta
