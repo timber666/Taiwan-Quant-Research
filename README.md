@@ -43,7 +43,7 @@ Web Dashboard
 - [ ] Phase 5：Portfolio + Risk Management
 - [ ] Phase 6：Productization
 
-目前狀態：Phase 0 完成，準備進入 Phase 1。
+目前狀態：**Phase 0 完成**，準備進入 **Phase 1：建立金融資料基礎設施**。
 
 ## Project Structure
 
