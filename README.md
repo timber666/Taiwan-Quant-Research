@@ -50,20 +50,20 @@ Web Dashboard
 ```
 Taiwan-Quant-Research/
 │
-├── data/          # 原始/處理後的資料
-├── database/      # 資料庫 schema 與初始化腳本
-├── ingestion/      # 資料下載與更新程式
-├── features/       # 特徵工程
-├── strategies/      # 交易策略邏輯
-├── backtest/       # 回測引擎
-├── models/         # 機器學習模型
-├── portfolio/       # 投資組合建構
-├── risk/          # 風險管理
-├── dashboard/       # Web Dashboard
-├── notebooks/       # 研究用 Jupyter Notebook
-├── tests/         # 單元測試
-├── docs/          # 技術文件與筆記
-├── config/         # 設定檔
+├── data/               # 原始/處理後的資料
+├── database/           # 資料庫 schema 與初始化腳本
+├── ingestion/          # 資料下載與更新程式
+├── features/           # 特徵工程
+├── strategies/         # 交易策略邏輯
+├── backtest/           # 回測引擎
+├── models/             # 機器學習模型
+├── portfolio/          # 投資組合建構
+├── risk/               # 風險管理
+├── dashboard/          # Web Dashboard
+├── notebooks/          # 研究用 Jupyter Notebook
+├── tests/              # 單元測試
+├── docs/               # 技術文件與筆記
+├── config/             # 設定檔
 └── requirements.txt
 ```
 
