@@ -4,9 +4,13 @@ from dotenv import load_dotenv
 
 # 專案根目錄的絕對路徑（不管在哪裡執行程式都能正確定位）
 BASE_DIR = Path(__file__).resolve().parent.parent
+# __file__: 此檔案的路徑
+# Path(): 包裝成 Path 物件
+# resolve(): 將路徑轉成絕對路徑，並正規化掉..、符號等
+# parent: 上一層
 
 # 資料庫路徑
-DATABASE_PATH = BASE_DIR / "database" / "quant.db"
+DATABASE_PATH = BASE_DIR / "database" / "quant.db"  # 路徑合併
 
 # 讀取金鑰
 load_dotenv(BASE_DIR / ".env")
