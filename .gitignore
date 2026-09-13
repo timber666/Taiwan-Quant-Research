@@ -78,6 +78,9 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# 拋棄式 spike notebook（底線開頭），內容含測試用的真實 API 呼叫，不需要進版本控制
+notebooks/_*.ipynb
+
 # IPython
 profile_default/
 ipython_config.py
