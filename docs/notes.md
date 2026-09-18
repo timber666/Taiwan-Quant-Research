@@ -43,3 +43,21 @@ notebook 執行就會找錯檔案（這正是舊版 `init_db.py` 的 bug）。�
 **為什麼要用**：上層程式（`downloader.py`）只呼叫 `source.fetch_prices(...)`，
 不用管背後是 FinMind 還是 TWSE。以後要換資料源或加備援，只要多寫一個繼承
 `PriceSource` 的 class，上層完全不用改。
+
+---
+
+## 步驟 12：指數退避（exponential backoff）
+
+**在哪裡**：`ingestion/sources/finmind_source.py` 的 `_call_with_retry()`
+
+**是什麼**：呼叫 API 失敗時自動重試，但每次重試前等待的時間愈來愈長
+（1 秒 → 2 秒 → 4 秒），而不是固定間隔。
+
+**關鍵字**：
+- `BACKOFF_BASE_SECONDS ** attempt`：`attempt` 是迴圈計數 0、1、2，
+  所以等待秒數是 2⁰、2¹、2²，呈指數成長
+- 「不該重試的錯誤」：權限不足（錯誤訊息含 `Your level is`）重試幾次都一樣會失敗，
+  直接 `raise` 往外丟，不要白等
+
+**為什麼要用**：呼叫失敗通常代表對方伺服器忙、或自己打太快。固定間隔重試等於
+持續加壓，愈等愈久才給對方喘息空間，成功率也比較高。這是串接外部 API 的標準做法。
