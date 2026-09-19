@@ -159,7 +159,7 @@ def plan_downloads(conn: sqlite3.Connection, universe: list[str]) -> dict[str, t
     return plan
 
 
-def _has_possible_trading_day(start: str, end: str) -> bool:
+def has_possible_trading_day(start: str, end: str) -> bool:
     """區間內有沒有可能開市的日子。
 
     只排除週六日——國定假日還是會白打一次 API，要完全避免得等有交易日曆
@@ -180,10 +180,12 @@ def _has_possible_trading_day(start: str, end: str) -> bool:
 
 
 def download_all(source: PriceSource, plan: dict[str, tuple[str, str]]) -> DownloadResult:
-    """依照 plan_downloads 算出的區間，把每一檔股票的股價抓下來。
+    """依照 plan_downloads 算出的區間，把每一檔股票的股價抓下來（只抓，不寫入）。
 
-    這一步只負責「抓」，不寫進資料庫——先確認資料抓得對，
-    之後再交給 cleaner -> validator -> loader 那條線處理。
+    **這不是正式管線用的路徑。** 正式流程是 ingestion/run_ingest.py，它改成逐檔
+    「抓完就寫、寫完就 commit」，這樣 API 額度中途用完時已處理的部分不會白抓
+    （步驟 29 放大到全市場時一定會遇到）。這支函式是步驟 15 的產物，
+    保留下來當「只想抓回來看一眼、先不要動資料庫」時用，例如在 notebook 裡探索資料。
 
     - 沒有東西可抓的（start > end，或區間內全是週末）直接跳過，不浪費 API 呼叫
     - 單檔抓取失敗會被記錄下來並跳過，不會讓整批下載中斷
@@ -198,7 +200,7 @@ def download_all(source: PriceSource, plan: dict[str, tuple[str, str]]) -> Downl
     failed: dict[str, str] = {}
 
     for stock_id, (start, end) in tqdm(plan.items(), desc="下載股價"):
-        if start > end or not _has_possible_trading_day(start, end):
+        if start > end or not has_possible_trading_day(start, end):
             skipped.append(stock_id)
             continue
         try:
