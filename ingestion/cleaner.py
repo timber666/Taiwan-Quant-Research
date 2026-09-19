@@ -97,11 +97,16 @@ def clean(df: pd.DataFrame, stock_id: str, source: str = DEFAULT_SOURCE) -> pd.D
         # 步驟 22 的 loader 要注意：缺值是 pd.NA，sqlite3 不認得，寫入前要轉成 None。
         out[col] = _to_numeric(out[col]).round().astype("Int64")
 
-    # 去重必須排在排序之前。keep="last" 的語意是「輸入裡比較後面那一筆」，也就是
-    # 比較晚抓到、比較新的那份；先排序的話，pandas 的 sort_values 預設不是穩定排序，
-    # 同一天的幾筆之間先後會被打亂，keep="last" 就變成隨機挑一筆了。
+    # 去重排在排序之前。keep="last" 的語意是「輸入裡比較後面那一筆」，也就是
+    # 比較晚抓到、比較新的那份；先排序的話，同一天的幾筆之間先後可能被打亂，
+    # keep="last" 就變成隨機挑一筆了。
+    #
+    # kind="stable" 是防呆：去重之後日期已經唯一，排序穩不穩定其實不影響結果，
+    # 但萬一之後有人把這兩行的順序對調（看起來完全無害），pandas 預設的
+    # quicksort 不保證穩定，那時就會變成隨機挑一筆、而且不會有任何錯誤訊息。
+    # 指定 stable 之後兩種順序都會得到正確結果，這個陷阱就不存在了。
     out = out.drop_duplicates(subset="date", keep="last")
-    out = out.sort_values("date").reset_index(drop=True)
+    out = out.sort_values("date", kind="stable").reset_index(drop=True)
 
     # 這兩欄一律以呼叫端的認知為準。來源自己帶的 stock_id 不保證跟我們要查的一致
     # （查 2330 卻回了別的代碼這種事發生過就很難查），以 plan_downloads 排的為準。
