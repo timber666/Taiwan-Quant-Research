@@ -144,12 +144,24 @@ class FinMindSource(PriceSource):
             ),
         })
 
+        # 同一個除權息交易日可能對到多筆公告（例如現金與股票分開公告）。
+        # dividend_events 的主鍵是 (stock_id, ex_date)，多筆同日資料在 UPSERT 時會
+        # 互相覆蓋，只留下最後一筆、默默把另一筆股利弄丟。在來源這層就先加總，
+        # 讓「一天 = 一筆事件」這個前提從資料進來的那一刻就成立。
+        div = div.groupby("ex_date", as_index=False).sum()
+
         # 官方參考價只用來交叉驗證，拿不到也不影響還原價計算，所以失敗時不擋主流程
         result = _call_with_retry(
             self.dl.taiwan_stock_dividend_result, stock_id=stock_id, start_date=start, end_date=end
         )
         if not result.empty:
-            ref = result[["date", "reference_price"]].rename(columns={"date": "ex_date"})
+            # merge 前先去重：官方資料若同一天有多筆，會把事件列複製出來，
+            # 等於從另一個方向把剛剛合併掉的重複又製造回來
+            ref = (
+                result[["date", "reference_price"]]
+                .rename(columns={"date": "ex_date"})
+                .drop_duplicates(subset="ex_date")
+            )
             div = div.merge(ref, on="ex_date", how="left")
         else:
             div["reference_price"] = None

@@ -212,6 +212,51 @@ def test_dividend_query_widens_end_but_leaves_start_alone(make_source):
 
 
 # ---------------------------------------------------------------------------
+# 坑 3：同一個除權息交易日對到多筆公告
+# ---------------------------------------------------------------------------
+
+def test_two_announcements_on_the_same_ex_date_are_merged(make_source):
+    """同日的多筆公告要在來源這層就合併成一筆。
+
+    不合併的話會從兩個方向出事：
+    1. dividend_events 的主鍵是 (stock_id, ex_date)，兩筆同日資料在 UPSERT 時
+       會互相覆蓋，只留下最後一筆，另一筆股利默默消失。
+    2. calculate_adjusted_price 是用 date 做 merge 的，同日多筆會把那天的
+       價格列複製出來，還原價也會算錯。
+    """
+    divs = pd.DataFrame([
+        dividend_row("2021-08-15", cash_ex_date="2021-08-09", cash_earnings=2.0),
+        dividend_row("2021-08-15", stock_ex_date="2021-08-09", stock_earnings=1.0),
+    ])
+    source, _ = make_source(dividends=divs)
+
+    out = source.fetch_dividends("2027", "2021-01-01", "2021-12-31")
+
+    assert len(out) == 1
+    assert out.loc[0, "ex_date"] == "2021-08-09"
+    assert out.loc[0, "cash_div"] == pytest.approx(2.0)
+    assert out.loc[0, "stock_div"] == pytest.approx(1.0)
+
+
+def test_duplicate_official_reference_price_does_not_duplicate_events(make_source):
+    """官方參考價那張表若同一天有多筆，merge 時會把事件列複製回來。
+
+    合併股利是為了讓「一天 = 一筆事件」成立，結果在補參考價時又破功，
+    等於白做——所以 merge 前要先去重。
+    """
+    divs = pd.DataFrame([dividend_row("2023-03-22", cash_ex_date="2023-03-16", cash_earnings=2.75)])
+    results = pd.DataFrame([
+        {"date": "2023-03-16", "reference_price": 508.25},
+        {"date": "2023-03-16", "reference_price": 508.25},
+    ])
+    source, _ = make_source(dividends=divs, results=results)
+
+    out = source.fetch_dividends("2330", "2023-01-01", "2023-12-31")
+
+    assert len(out) == 1
+
+
+# ---------------------------------------------------------------------------
 # 既有行為：不要在修坑的時候改壞
 # ---------------------------------------------------------------------------
 

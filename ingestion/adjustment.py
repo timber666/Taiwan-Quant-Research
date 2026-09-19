@@ -17,7 +17,8 @@ def calculate_adjusted_price(df_price: pd.DataFrame, df_div: pd.DataFrame) -> pd
     Args:
         df_price: 至少要有 date, open, high, low, close 欄位的原始日線
         df_div: 至少要有 date（除權息交易日）, cash_div（現金股利/每股）,
-            stock_div（股票股利/每 10 股配股數）欄位
+            stock_div（股票股利/每 10 股配股數）欄位。
+            同一天出現多筆事件會自動加總，呼叫端不必自己先合併。
 
     Returns:
         df_price 加上 adj_open/adj_high/adj_low/adj_close 欄位的 DataFrame，
@@ -36,9 +37,20 @@ def calculate_adjusted_price(df_price: pd.DataFrame, df_div: pd.DataFrame) -> pd
 
     div = df_div[["date", "cash_div", "stock_div"]].copy()
     div["date"] = pd.to_datetime(div["date"])
+    # 同一天可能有多筆事件（例如現金與股票分開公告）。不先合併就 merge 的話，
+    # 一天有幾筆事件、那天的價格列就會被複製幾份，而且每一筆各自去算調整因子時，
+    # 第二筆拿到的 prev_close 會是「同一天自己的收盤價」而不是真正的前一日收盤價，
+    # 算出來的還原價是錯的（實測：200 -> 95.0，正確應為 97.5）。
+    # 相加是正確的合併方式：證交所公式 P_ref = (P_prev − D) / (1 + S) 本來就同時
+    # 吃現金股利與股票股利，同一天的事件合併成一筆 (D_total, S_total) 才符合公式。
+    div = div.groupby("date", as_index=False).sum()
     df = pd.merge(df, div, on="date", how="left")
-    df["cash_div"] = df["cash_div"].fillna(0)
-    df["stock_div"] = df["stock_div"].fillna(0)
+    # to_numeric 而不是直接 fillna：df_div 沒有任何事件時（步驟 24 之後這是常態——
+    # 大多數股票在大多數區間裡都沒有除權息），merge 進來的會是 object dtype 的空欄位，
+    # 對它 fillna 會觸發 pandas 的 downcasting FutureWarning，而且後續算術也不保證正確。
+    # 先轉成數值再補 0，順便把萬一混進來的字串擋掉。
+    df["cash_div"] = pd.to_numeric(df["cash_div"], errors="coerce").fillna(0.0)
+    df["stock_div"] = pd.to_numeric(df["stock_div"], errors="coerce").fillna(0.0)
 
     df["prev_close"] = df["close"].shift(1)
     df["split_ratio"] = df["stock_div"] / 10.0
