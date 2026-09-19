@@ -10,6 +10,9 @@ FinMindSource 的單元測試。
    遇到整筆都配在公積的股票（例如 2409 友達）甚至完全不還原。
 2. FinMind 股利 API 的日期過濾用的是「權利分派基準日」，比除權息交易日
    晚 6〜10 天，直接拿 end 去查會漏掉區間尾端的事件（例如 6669 緯穎）。
+
+還原股價的計算不在這裡測——步驟 16 之後它已經跟 FinMind 無關了，
+測試在 tests/test_adjustment.py。
 """
 
 import sys
@@ -20,6 +23,7 @@ import pandas as pd
 import pytest
 
 from ingestion.sources import finmind_source
+from ingestion.sources.base import RateLimitError
 from ingestion.sources.finmind_source import FinMindSource
 
 DIVIDEND_COLUMNS = [
@@ -257,32 +261,87 @@ def test_official_reference_price_is_attached_for_cross_checking(make_source):
 
 
 # ---------------------------------------------------------------------------
-# 端到端：fetch_prices 有沒有真的把還原價算對
+# fetch_prices：只回原始價
 # ---------------------------------------------------------------------------
 
-def test_fetch_prices_adjusts_close_using_total_dividend(make_source):
-    """串起 fetch_dividends + calculate_adjusted_price，用 2409 友達的真實數字。
+def test_fetch_prices_returns_raw_ohlcv_without_touching_dividend_api(make_source):
+    """步驟 16 之後，fetch_prices 只做一件事：如實回報原始日線。
 
-    除息日 2023-08-10、現金股利 0.80（全部來自公積）：
-      前一日還原價 = (20.40 - 0.80) / 1 = 19.60（= 官方 reference_price）
-      除息日當天不打折，還原價維持 18.95
+    守住兩件事：
+    1. 欄位裡不能有 adj_close——還原價改由 database/data_access.py 在讀取時計算
+       （理由見 database/schema.sql 裡 prices 的註解）。
+    2. 不能為了算還原價而順手多打一次股利 API，那是白花免費額度。
     """
-    prices = pd.DataFrame([
-        price_row("2023-08-08", 20.40),
-        price_row("2023-08-09", 20.40),
-        price_row("2023-08-10", 18.95),
-        price_row("2023-08-11", 18.50),
-    ])
-    divs = pd.DataFrame([dividend_row("2023-08-16", cash_ex_date="2023-08-10",
-                                      cash_earnings=0.0, cash_surplus=0.80)])
-    source, _ = make_source(dividends=divs, prices=prices)
+    prices = pd.DataFrame([price_row("2023-08-09", 20.40), price_row("2023-08-10", 18.95)])
+    divs = pd.DataFrame([dividend_row("2023-08-16", cash_ex_date="2023-08-10", cash_surplus=0.80)])
+    source, fake = make_source(dividends=divs, prices=prices)
 
     out = source.fetch_prices("2409", "2023-08-01", "2023-08-31")
-    adj = out.set_index("date")["adj_close"]
 
-    assert adj["2023-08-09"] == pytest.approx(19.60)
-    assert adj["2023-08-10"] == pytest.approx(18.95)
-    assert adj["2023-08-11"] == pytest.approx(18.50)
-    assert list(out.columns) == [
-        "date", "open", "high", "low", "close", "adj_close", "volume", "turnover"
-    ]
+    assert list(out.columns) == ["date", "open", "high", "low", "close", "volume", "turnover"]
+    assert out.loc[out["date"] == "2023-08-10", "close"].iloc[0] == pytest.approx(18.95)
+    assert [c["api"] for c in fake.calls] == ["daily"]      # 沒有多打股利
+
+
+def test_fetch_prices_sorts_by_date_ascending(make_source):
+    """介面契約寫了「依日期升冪」，就算上游亂序回傳也要自己排好"""
+    prices = pd.DataFrame([price_row("2023-08-10", 18.95), price_row("2023-08-09", 20.40)])
+    source, _ = make_source(prices=prices)
+
+    out = source.fetch_prices("2409", "2023-08-01", "2023-08-31")
+
+    assert list(out["date"]) == ["2023-08-09", "2023-08-10"]
+
+
+# ---------------------------------------------------------------------------
+# _call_with_retry：哪些錯誤該重試、哪些重試只是白等
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    """讓重試不要真的睡，測試才跑得快"""
+    monkeypatch.setattr(finmind_source.time, "sleep", lambda _: None)
+
+
+def test_transient_error_is_retried(no_sleep):
+    """一般錯誤（連線中斷之類）要重試，第三次成功就算成功"""
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise RuntimeError("connection reset by peer")
+        return "ok"
+
+    assert finmind_source._call_with_retry(flaky) == "ok"
+    assert len(attempts) == 3
+
+
+def test_rate_limit_raises_dedicated_error_without_retrying(no_sleep):
+    """額度用完：FinMind 是每小時 600 次，退避幾秒再試沒有任何意義。
+
+    要丟 RateLimitError 讓上層知道該中止整批（見 base.RateLimitError），
+    而不是重試三次後丟一個跟其他失敗長得一樣的 Exception。
+    """
+    attempts = []
+
+    def limited():
+        attempts.append(1)
+        raise Exception("FinMind API unexpected response: Requests reach the upper limit.")
+
+    with pytest.raises(RateLimitError):
+        finmind_source._call_with_retry(limited)
+    assert len(attempts) == 1      # 一次就放棄，沒有白等
+
+
+def test_permission_error_is_not_retried(no_sleep):
+    """免費會員權限不足（例如呼叫 taiwan_stock_daily_adj），重試幾次都一樣被拒"""
+    attempts = []
+
+    def forbidden():
+        attempts.append(1)
+        raise Exception("Your level is register. Please update your user level.")
+
+    with pytest.raises(Exception, match="Your level is"):
+        finmind_source._call_with_retry(forbidden)
+    assert len(attempts) == 1

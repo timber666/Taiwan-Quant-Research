@@ -19,7 +19,7 @@ from database.connection import get_connection
 from ingestion.downloader import sync_stock_list, plan_downloads, download_all
 from ingestion.sources.base import PriceSource
 
-PRICE_COLUMNS = ["date", "open", "high", "low", "close", "adj_close", "volume", "turnover"]
+PRICE_COLUMNS = ["date", "open", "high", "low", "close", "volume", "turnover"]
 
 
 class FakeSource(PriceSource):
@@ -51,7 +51,7 @@ class FakeSource(PriceSource):
 def price_frame(dates):
     return pd.DataFrame([
         {"date": d, "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0,
-         "adj_close": 10.0, "volume": 1000, "turnover": 10000.0}
+         "volume": 1000, "turnover": 10000.0}
         for d in dates
     ], columns=PRICE_COLUMNS)
 

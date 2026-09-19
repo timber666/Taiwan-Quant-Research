@@ -19,7 +19,7 @@
 
 - [x] 階段 A：前置設定與資料來源評估（步驟 1〜6）
 - [x] 階段 B：資料庫 Schema 重設計（步驟 7〜10）
-- [ ] 階段 C：Downloader（步驟 11〜15）
+- [x] 階段 C：Downloader（步驟 11〜15）
 - [ ] 階段 D：Cleaner + Validator + Loader（步驟 16〜23）
 - [ ] 階段 E：資料存取層 + EDA + 驗收（步驟 24〜30）
 
@@ -71,7 +71,7 @@
   - 每個來源記錄：欄位完整度、有沒有還原價、速率限制、抓 5 年要多久、上手難度。
 - **完成標準**：能跑出 2330 近 5 年的還原日線 DataFrame，並知道每個來源的優缺點。
 
-## 步驟 4：寫 `docs/data_sources.md`
+## 步驟 4：寫 `docs/data_source.md`
 
 - **為什麼**：這是面試講「你怎麼做技術選型」的素材，比口頭講有說服力。
 - **怎麼做**：一頁就好，包含：三個來源的比較表、最後選哪個當主來源、選它的理由、
@@ -86,7 +86,7 @@
   1. 找一檔近年有配息的股票（例如 2412 中華電），在 spike notebook 把
      `close` 和 `adj_close` 疊在同一張圖。
   2. 挑除息日前後兩天，手算一次：原始價跌了多少、還原價為什麼是連續的。
-  3. 在 `docs/data_sources.md` 補一小段「還原股價說明」。
+  3. 在 `docs/data_source.md` 補一小段「還原股價說明」。
 - **完成標準**：你能用自己的話解釋「為什麼回測要用 adj_close，畫真實股價要用 close」。
 
 ## 步驟 6：定義投資範圍（universe）
@@ -241,24 +241,118 @@
 
 # 階段 D：Cleaner + Validator + Loader（第 5 週）
 
-## 步驟 16：`ingestion/cleaner.py`
+## 本階段的設計決策：還原股價改成「讀取時計算」
+
+原本的規劃是把 `adj_close` 當成 `prices` 表的一個欄位，在寫入時算好存進去。
+進入階段 D 前重新檢查，發現這個設計跟階段 C 的**增量更新會互相衝突**，
+所以這裡先改掉，再往下做。
+
+**問題**：`ingestion/adjustment.py` 是後還原（backward adjustment），調整因子只能
+從「本次抓取視窗內」的除權息事件算出來。全量第一次跑沒問題，但之後每次除權息，
+資料庫裡更早的 `adj_close` 就全部過期了，而增量流程不會回頭改它們。用專案裡真正的
+`calculate_adjusted_price` 實測（收盤價固定 100，2024-03-13 除息 10 元），
+依視窗邊界落在哪裡，會出現兩種不同的錯：
+
+| 情境 | 症狀 |
+|---|---|
+| DB 已存到 03-12，新視窗從 03-13（事件是視窗第一列）開始 | 事件當天 `prev_close` 是 NaN（`shift(1)` 取不到視窗外的前一天）→ 調整因子變成 NaN → 被 `shift(-1)` 推出陣列，**這次事件完全沒有被還原**，+11.11% 的報酬整個消失 |
+| DB 已存到 03-11，新視窗從 03-12 開始（事件是視窗第二列） | 視窗內的 03-12 被打折、視窗外的 03-11 沒有，**在序列中間憑空生出 -10% 的假跳空**，回測會當成真的暴跌 |
+
+**決定**：`prices` 表只存**原始事實**（raw OHLCV），除權息事件存進 `dividend_events`，
+還原價變成**衍生視圖**，由步驟 24 的 `database/data_access.py` 在讀取時即時計算。
+
+**為什麼這樣比較好**：
+
+1. 結構上根除快取過期問題，而不是每次除權息都回頭 UPDATE 歷史列（那會讓
+   `ingested_at` 失去意義，稽核性變差）。
+2. 原始價是不可變的事實，還原價是隨時可重算的視圖，兩者分開是資料工程的常見分層。
+3. 可以做 point-in-time 回溯（「2023-06-01 當下看到的序列長什麼樣」），
+   Phase 3 因子研究要避免 look-ahead bias 時會用到。
+4. 效能不是問題：38 檔 × 10 年不到 10 萬列，pandas 算一次幾十毫秒。
+
+**代價**：`prices` 少一個欄位、`fetch_prices` 不再回傳 `adj_close`，
+`ingestion/adjustment.py` 在步驟 24 之前會暫時沒有呼叫者（不是死碼，是還沒接上）。
+
+---
+
+## 步驟 16：前置重構 — 讓 `prices` 只存原始價
+
+- **為什麼**：見上面的設計決策。這一步要先把資料結構與介面改對，否則後面
+  cleaner / loader 都會照著錯的欄位寫，改起來更痛。
+- **怎麼做**：
+  1. `database/schema.sql`：
+     - `prices` 移除 `adj_close` 欄位。
+     - `data_quarantine` 補主鍵 `PRIMARY KEY (stock_id, date, reason)`。
+       目前這張表沒有主鍵，重跑 ingest 會把同樣的壞資料一直往裡疊，
+       數字會愈跑愈大，看不出「這次真的隔離了幾筆」。
+  2. `ingestion/sources/base.py`：`fetch_prices` 的 docstring 改成回傳
+     `date, open, high, low, close, volume, turnover`（不含 `adj_close`），
+     並註明還原價由 `database/data_access.py` 在讀取時計算。
+  3. `ingestion/sources/finmind_source.py`：
+     - `fetch_prices` 不再呼叫 `fetch_dividends` / `calculate_adjusted_price`，
+       欄位改名後直接回傳原始價。
+     - `_call_with_retry` 補上速率限制的特別處理（步驟 12 原本就要求但沒做）：
+       FinMind 是**每小時** 600 次的額度，撞到時 1→2→4 秒的退避完全不夠，
+       會三次全敗。訊息含 rate limit / 429 時要嘛拉長等待、要嘛直接放棄並回報，
+       不要假裝重試過。
+  4. 跟著改的測試：
+     - `tests/test_db_connection.py` 的 expected 欄位清單。
+     - `tests/test_downloader.py` 的 `PRICE_COLUMNS`。
+     - `tests/test_finmind_source.py` 的 `test_fetch_prices_adjusts_close_using_total_dividend`
+       → 搬到步驟 17 的 `tests/test_adjustment.py`，改成直接測
+       `calculate_adjusted_price`；原地改留一個「`fetch_prices` 不該再打股利 API」
+       的測試（用假 DataLoader 的 `calls` 驗證）。
+  5. 刪掉 `database/quant.db` 重跑 `python database/init_db.py`。
+     `prices` 目前是空的，沒有資料損失；`stocks` 那 38 檔下次跑 ingest 會自動重建。
+- **完成標準**：`pytest` 全綠；`PRAGMA table_info(prices)` 看不到 `adj_close`；
+  `FinMindSource.fetch_prices` 回傳 7 個欄位，而且只打了一次 `taiwan_stock_daily`。
+
+## 步驟 17：修 `calculate_adjusted_price` 的同日多筆事件缺陷
+
+- **為什麼**：`calculate_adjusted_price` 內部用 `pd.merge(df, div, on="date")` 合併
+  除權息事件，**沒有保證 `date` 唯一**。同一天出現兩筆事件（例如現金與股票分兩筆公告）
+  時，價格列會被複製一份，還原也會被重複打折。實測：輸入 3 列價格 + 同日兩筆事件
+  （現金 5 元、股票每 10 股配 10 股），輸出變成 4 列，`adj_close` 被折成 47.5
+  （正確值 95）。同日同時除權又除息在台股並不罕見，這個地雷遲早會踩到，
+  而且步驟 24 之後**所有**還原價都會經過這個函式，影響面比現在大。
+- **怎麼做**：在 `calculate_adjusted_price` 開頭先把事件依日期彙總：
+  ```python
+  div = (df_div[["date", "cash_div", "stock_div"]]
+         .groupby("date", as_index=False)
+         .sum())
+  ```
+  相加是正確的做法：證交所公式 `P_ref = (P_prev − D) / (1 + S)` 本來就同時吃現金
+  股利與股票股利，同一天的多筆事件合併成一筆 `(D_total, S_total)` 才符合公式；
+  拆開來連套兩次反而會在第二次用到已經被折過的 `P_prev`，算出更錯的數字。
+- 新增 `tests/test_adjustment.py`：
+  - 同日兩筆事件 → 輸出列數等於輸入列數，且 `adj_close` 正確（回歸測試）
+  - 從 `test_finmind_source.py` 搬過來的 2409 友達案例（全部配在公積）
+  - 多次事件累乘（用 `docs/data_source.md` 記錄的 6669 兩次真實事件）
+  - 事件當天不打折（守住目前 `shift(-1)` 那個修正，別在重構時弄壞）
+- **完成標準**：`pytest tests/test_adjustment.py` 全綠；把 `groupby` 拿掉，
+  同日多筆事件那個 test 會失敗（突變測試確認測試真的有守住東西）。
+
+## 步驟 18：`ingestion/cleaner.py`
 
 - **怎麼做**：寫 `clean(df, stock_id) -> pd.DataFrame`，做：
   - 日期統一成 `YYYY-MM-DD` 字串
   - 數值欄位轉 float / int，無法轉的設 NaN
   - 依 `date` 去重（保留最後一筆）、升冪排序
   - 補上 `stock_id`、`source="FinMind"` 欄位
-  - 欄位順序對齊 `prices` 表
+  - 欄位順序對齊步驟 16 之後的 `prices` 表：
+    `stock_id, date, open, high, low, close, volume, turnover, source`
+    （**沒有 `adj_close`**）
 - **完成標準**：丟一個「有重複日期、有字串數字、亂序」的假 DataFrame 進去，出來是乾淨的。
 
-## 步驟 17：cleaner 測試 `tests/test_cleaner.py`
+## 步驟 19：cleaner 測試 `tests/test_cleaner.py`
 
 - **怎麼做**：針對上面每一種髒狀況各寫一個 test case。
 - **完成標準**：`pytest tests/test_cleaner.py` 全綠。
 
-## 步驟 18：`ingestion/validator.py`
+## 步驟 20：`ingestion/validator.py`
 
-- **怎麼做**：寫 `validate(df) -> tuple[good_df, bad_df]`，`bad_df` 附 `reason`。規則：
+- **怎麼做**：寫 `validate(df, ex_dates=None) -> tuple[good_df, bad_df]`，
+  `bad_df` 附 `reason`。規則：
   - `high >= low`、`high >= open`、`high >= close`、`low <= open`、`low <= close`
   - `open/high/low/close > 0`
   - `volume >= 0`
@@ -266,45 +360,73 @@
   - 單日 `close` 相對前一日漲跌幅 `abs > 0.15` → 標記 `reason="price_jump"`
     （**標記但不隔離**，因為可能是真的，例如減資）
   - 前四類違規 → 進 `bad_df`
-- **完成標準**：丟一個含 `high < low` 的列，它會被分到 `bad_df` 且 reason 正確。
+- **為什麼多一個 `ex_dates` 參數**：`price_jump` 是拿**原始價**算的，而除權息當天
+  原始價本來就會跳空。6669 緯穎 2026-09-02 是 7800 → 2610（-66%），
+  2409 友達每年除息也都會觸發。不排除的話，quarantine 報表會被除權息洗版，
+  真正需要人看的異常反而被埋掉。`ex_dates` 是一個「該股除權息交易日」的集合，
+  由步驟 23 的 orchestrator 從剛抓到的股利事件傳進來；這些日子跳過 `price_jump` 檢查。
+- **完成標準**：丟一個含 `high < low` 的列，它會被分到 `bad_df` 且 reason 正確；
+  同樣一個 -30% 的跌幅，日期在 `ex_dates` 裡不會被標記、不在裡面會被標記。
 
-## 步驟 19：validator 測試 `tests/test_validator.py`
+## 步驟 21：validator 測試 `tests/test_validator.py`
 
-- **怎麼做**：每條規則一個 test case。
+- **怎麼做**：每條規則一個 test case，`price_jump` 要寫「除權息日 / 非除權息日」
+  兩個對照組。
 - **完成標準**：全綠。
 
-## 步驟 20：`ingestion/loader.py`
+## 步驟 22：`ingestion/loader.py` + 冪等測試 `tests/test_loader.py`
 
-- **怎麼做**：
-  - `upsert_prices(conn, good_df)`：用
+- **怎麼做**：四個函式
+  - `upsert_prices(conn, good_df)`：
     `INSERT INTO prices (...) VALUES (...) ON CONFLICT(stock_id, date) DO UPDATE SET ...`
-  - `quarantine(conn, bad_df)`：寫進 `data_quarantine`（`raw_json` 存整列的 JSON）
+  - `upsert_dividends(conn, stock_id, div_df)`：寫進 `dividend_events`，
+    `ON CONFLICT(stock_id, ex_date) DO UPDATE`。
+    **這是新增的、也是整個階段 D 最關鍵的一步** —— 這張表從階段 B 建好到現在
+    一直是空的，而步驟 24 讀取時要還原股價，唯一的資料來源就是它。
+    沒有這一步，步驟 24 無米可炊。
+  - `quarantine(conn, bad_df)`：寫進 `data_quarantine`（`raw_json` 存整列的 JSON），
+    用步驟 16 加的主鍵做 `ON CONFLICT(stock_id, date, reason) DO UPDATE`，
+    重跑不會疊加。
   - `update_ingest_log(conn, stock_id, df)`：更新 `last_date`、`last_run_at`、`rows_total`
-- **完成標準**：同一份 DataFrame 連續 upsert 兩次，`SELECT COUNT(*) FROM prices` 數字不變。
+- **注意寫入順序**：`database/connection.py` 強制開啟外鍵檢查，而 `prices`、
+  `ingest_log`、`dividend_events` 三張表都有 FK 指向 `stocks`。
+  所以它們一律要在 `sync_stock_list` 之後才能寫，否則會 `IntegrityError`。
+- **測試**：同一份資料連續跑兩次，`prices` / `dividend_events` / `data_quarantine`
+  三張表的列數都不變；第二次跑會更新 `ingested_at` 但不新增列。
+- **完成標準**：`pytest tests/test_loader.py` 全綠。
 
-## 步驟 21：loader 冪等測試 `tests/test_loader.py`
-
-- **怎麼做**：測「跑兩次列數不變」「第二次跑會更新 ingested_at 但不新增列」。
-- **完成標準**：全綠。
-
-## 步驟 22：`ingestion/run_ingest.py` — 串起整條管線
+## 步驟 23：`ingestion/run_ingest.py` — 串起整條管線並實跑
 
 - **怎麼做**：orchestrator，流程：
   ```
   connect DB
   → sync_stock_list
   → plan_downloads
-  → for each stock: download → clean → validate → upsert + quarantine + update log
-  → 印出摘要: 新增 X 列 / 更新 Y 列 / 隔離 Z 列 / 涵蓋 N 檔 / 日期範圍 ...
+  → for each stock:
+        fetch_dividends  → upsert_dividends        （先做，validate 需要 ex_dates）
+        fetch_prices     → clean
+                         → validate(df, ex_dates)
+                         → upsert_prices + quarantine
+                         → update_ingest_log
+  → 印出摘要: 新增 X 列 / 更新 Y 列 / 隔離 Z 列 / 除權息事件 E 筆 / 涵蓋 N 檔 / 日期範圍 ...
   ```
   加 `argparse`：`--mode sample|all`、`--stock 2330`（只跑單檔，方便除錯）。
-- **完成標準**：`python ingestion/run_ingest.py --mode sample` 一次跑完並印出摘要。
-
-## 步驟 23：實跑全量 ingest
-
-- **怎麼做**：跑 `run_ingest.py --mode sample`，把資料真正灌進 `quant.db`。
-  檢查 `data_quarantine` 有沒有非預期的東西。
-- **完成標準**：`prices` 表有數萬列真實資料，quarantine 裡的東西你都能解釋。
+- **執行方式是 `python -m ingestion.run_ingest --mode sample`**，
+  不是 `python ingestion/run_ingest.py`。已實測：`ingestion/` 裡用的是相對 import
+  （`from .sources.base import ...`），直接把檔案當腳本跑會得到
+  `ImportError: attempted relative import with no known parent package`。
+  這點跟原規劃寫的指令不同，以這裡為準。
+- **API 額度**：sample 的 38 檔 × 每檔 3 次呼叫（daily + dividend + dividend_result）
+  = 114 次，安全落在 FinMind 免費的 600 次/hr 內。步驟 29 要放大到全市場時，
+  1700+ 檔 × 3 ≈ 5100 次會直接爆掉，那時才需要分批或跨小時排程。
+- **實跑並檢查**：跑 `--mode sample` 把資料真正灌進 `quant.db`，然後：
+  - `SELECT COUNT(*) FROM prices` 應該有數萬列
+  - `SELECT COUNT(*) FROM dividend_events` 應該接近 `docs/data_source.md` 記錄的
+    464 筆（2015 年至今、38 檔）
+  - `SELECT reason, COUNT(*) FROM data_quarantine GROUP BY reason`
+    裡面每一類你都要能解釋為什麼
+- **完成標準**：一次跑完並印出摘要；`prices` 有數萬列真實資料；
+  `dividend_events` 不是空的；quarantine 裡的東西你都能解釋。
 
 ---
 
@@ -313,6 +435,8 @@
 ## 步驟 24：`database/data_access.py`
 
 - **為什麼**：Phase 2 回測引擎只會透過這層拿資料，不會自己碰 SQL。
+  而且經過階段 D 的設計調整，**還原股價是在這一層算的**（`prices` 表只存原始價，
+  `dividend_events` 存事件），所以這層不只是包 SQL，它是還原價唯一的產出點。
 - **怎麼做**：
   ```python
   def get_prices(stock_id, start=None, end=None, adjusted=True) -> pd.DataFrame
@@ -320,8 +444,16 @@
   def get_price_matrix(stock_ids, field="adj_close", start=None, end=None) -> pd.DataFrame
   # get_price_matrix: index=date, columns=stock_id
   ```
+  `adjusted=True` 時：撈原始價 → 撈該股的 `dividend_events` →
+  用 `ingestion/adjustment.py` 的 `calculate_adjusted_price` 算出 `adj_close`。
   全部走 `config.settings.DATABASE_PATH`。
-- **完成標準**：`get_prices("2330", "2023-01-01")` 回傳一個以 date 為 index 的 DataFrame。
+- **⚠️ 最容易錯的地方**：要套用的事件是「`ex_date` 晚於查詢區間起點的**全部**事件」，
+  **不能被查詢的 `end` 限制住**。例如 `get_prices("2330", "2020-01-01", "2020-12-31")`
+  必須把 2021 年到今天的所有除權息都算進去，否則這段 2020 年的序列會跟
+  「查 2015〜今天再切出 2020 年」那段對不起來，同一檔股票在不同查詢下報酬會不一致。
+- **完成標準**：`get_prices("2330", "2023-01-01")` 回傳一個以 date 為 index 的 DataFrame；
+  且 `get_prices("2330", "2020-01-01", "2020-12-31")` 的 `adj_close`
+  跟 `get_prices("2330", "2015-01-01").loc["2020"]` 完全一致。
 
 ## 步驟 25：data_access 測試 `tests/test_data_access.py`
 
@@ -374,12 +506,14 @@
 ## Phase 1 最終檢查清單
 
 - [ ] `requirements.txt` 正常編碼、含 FinMind
-- [ ] `docs/data_sources.md`（來源評估 + 還原股價說明）
-- [ ] `database/schema.sql`：stocks / prices(含 adj_close) / ingest_log / data_quarantine
+- [ ] `docs/data_source.md`（來源評估 + 還原股價說明）
+- [ ] `database/schema.sql`：stocks / prices(只存原始價) / dividend_events /
+      ingest_log / data_quarantine(有主鍵)
 - [ ] `database/init_db.py`：只建表、冪等、走 settings 路徑
 - [ ] `ingestion/`：base、finmind_source、downloader、cleaner、validator、loader、run_ingest
-- [ ] `tests/`：cleaner、validator、loader、data_access 測試全綠
+- [ ] `tests/`：adjustment、cleaner、validator、loader、data_access 測試全綠
 - [ ] `database/data_access.py`：get_prices / get_universe / get_price_matrix
+      （還原價在這層即時計算）
 - [ ] `notebooks/02_data_quality_eda.ipynb` 跑得動
 - [ ] 增量更新驗證過
 - [ ] `docs/data_dictionary.md` + README pipeline 圖 + journal 更新

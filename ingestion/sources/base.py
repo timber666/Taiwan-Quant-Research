@@ -11,6 +11,17 @@ from abc import ABC, abstractmethod
 import pandas as pd
 
 
+class RateLimitError(Exception):
+    """資料來源的呼叫額度用完了。
+
+    刻意獨立成一個型別，而不是混在一般的 Exception 裡，因為它的正確處置方式
+    跟其他錯誤完全不同：單一檔股票抓失敗可以跳過、繼續抓下一檔；但額度用完之後
+    「下一檔」也一定會失敗，繼續跑只是把同一則錯誤訊息複製 N 份，還白白吃掉
+    重試的等待時間。上層（run_ingest）看到這個型別應該直接中止整批，
+    把已經抓到的部分收好，等額度回復再跑增量更新。
+    """
+
+
 class PriceSource(ABC):
     """所有資料來源（FinMind、TWSE OpenAPI...）都要繼承這個類別並實作以下方法。"""
 
@@ -25,15 +36,18 @@ class PriceSource(ABC):
 
     @abstractmethod
     def fetch_prices(self, stock_id: str, start: str, end: str) -> pd.DataFrame:
-        """抓取單一股票在區間內的日線股價，包含還原收盤價。
+        """抓取單一股票在區間內的**原始**日線股價，依日期升冪排序。
 
-        回傳欄位：date, open, high, low, close, adj_close, volume, turnover
+        回傳欄位：date, open, high, low, close, volume, turnover
         對齊 database/schema.sql 的 prices 表（不含 stock_id/source/ingested_at，
         這些由呼叫端補上）。
 
-        adj_close 不一定是資料源直接提供的（例如 FinMind 免費會員無法取得
-        taiwan_stock_daily_adj），實作內部可以自己用 fetch_dividends() 的結果
-        計算還原價，只要回傳的 DataFrame 有這個欄位即可。
+        **不要回傳還原價。** 還原價是後還原，調整因子取決於「這一天之後發生過哪些
+        除權息」，而資料來源一次只看得到被查詢的那個區間——增量更新時區間只有幾天，
+        算出來的還原價是錯的（詳見 database/schema.sql 裡 prices 的註解）。
+        資料來源的職責只到「如實回報那幾天市場上的原始成交價」為止；
+        還原價由 database/data_access.py 在讀取時，用 dividend_events 的完整事件
+        歷史重新計算。
         """
         raise NotImplementedError
 

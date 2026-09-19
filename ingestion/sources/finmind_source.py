@@ -1,10 +1,13 @@
 """
 FinMind 資料來源實作。
 
-還原股價（adj_close）不是直接跟 FinMind 拿的——免費會員拿不到
-taiwan_stock_daily_adj（見 docs/data_source.md 已知限制），這裡改成抓
-taiwan_stock_daily（原始價）+ taiwan_stock_dividend（除權息公告），
-自己用 ingestion/adjustment.py 算還原價。
+這裡只負責「如實回報 FinMind 給了什麼」：taiwan_stock_daily 出原始日線、
+taiwan_stock_dividend 出除權息事件，兩者各自獨立回傳，不在這一層做還原計算。
+
+（免費會員本來就拿不到 taiwan_stock_daily_adj，見 docs/data_source.md 的已知限制；
+但就算拿得到，在這裡算還原價也是錯的——資料來源一次只看得到被查詢的那個區間，
+增量更新時算出來的還原價會失真。還原改由 database/data_access.py 在讀取時，
+拿 dividend_events 的完整事件歷史重算，詳見 database/schema.sql 裡 prices 的註解。）
 """
 
 import time
@@ -13,8 +16,7 @@ from datetime import date, timedelta
 import pandas as pd
 from FinMind.data import DataLoader
 
-from .base import PriceSource
-from ..adjustment import calculate_adjusted_price
+from .base import PriceSource, RateLimitError
 
 # 呼叫之間固定小睡一下，降低打到免費額度上限的機率
 CALL_DELAY_SECONDS = 0.3
@@ -29,8 +31,24 @@ BACKOFF_BASE_SECONDS = 2
 DIVIDEND_LOOKAHEAD_DAYS = 30
 
 
+# 重試救不了的兩類錯誤，靠比對錯誤訊息辨識。
+# FinMind 套件本身沒有定義例外型別，也沒有把 HTTP status code 帶出來——它是在
+# FinMind/data/finmind_api.py 的 _extract_data() 裡把伺服器回的 msg 包成一般
+# Exception 丟出來，所以只能用字串比對。下面的關鍵字是依這條路徑推測的，
+# 沒辦法在不真的打爆額度的情況下驗證，之後若看到漏接的訊息就往清單裡加。
+PERMISSION_MARKERS = ("your level is",)          # 免費會員權限不足（已實測，見 docs/data_source.md）
+RATE_LIMIT_MARKERS = ("upper limit", "too many requests", "rate limit", "request limit")
+
+
 def _call_with_retry(func, *args, **kwargs):
-    """呼叫 FinMind API，失敗時重試（指數退避），但方案限制類的錯誤不重試。"""
+    """呼叫 FinMind API，失敗時重試（指數退避）。
+
+    兩類錯誤不重試，因為重試救不了、只是白等：
+    - 權限不足（免費會員呼叫付費資料集）：重試幾次都一樣會被拒絕。
+    - 額度用完：FinMind 免費會員是**每小時** 600 次，1→2→4 秒的退避對一個
+      以小時為單位的額度毫無意義，等於假裝重試過。改成丟 RateLimitError，
+      讓上層知道該中止整批而不是繼續抓下一檔（理由見 base.RateLimitError）。
+    """
     last_err = None
     for attempt in range(MAX_RETRIES):
         try:
@@ -39,9 +57,11 @@ def _call_with_retry(func, *args, **kwargs):
             return result
         except Exception as e:
             last_err = e
-            # 免費會員權限不足（例如呼叫 taiwan_stock_daily_adj）重試沒有意義，直接往外丟
-            if "Your level is" in str(e):
+            message = str(e).lower()
+            if any(m in message for m in PERMISSION_MARKERS):
                 raise
+            if any(m in message for m in RATE_LIMIT_MARKERS):
+                raise RateLimitError(str(e)) from e
             time.sleep(BACKOFF_BASE_SECONDS ** attempt)
     raise last_err
 
@@ -137,7 +157,8 @@ class FinMindSource(PriceSource):
         return div[columns].reset_index(drop=True)
 
     def fetch_prices(self, stock_id: str, start: str, end: str) -> pd.DataFrame:
-        columns = ["date", "open", "high", "low", "close", "adj_close", "volume", "turnover"]
+        """原始日線，不含還原價（理由見模組 docstring 與 base.PriceSource）。"""
+        columns = ["date", "open", "high", "low", "close", "volume", "turnover"]
 
         raw = _call_with_retry(
             self.dl.taiwan_stock_daily, stock_id=stock_id, start_date=start, end_date=end
@@ -150,15 +171,9 @@ class FinMindSource(PriceSource):
             "min": "low",
             "Trading_Volume": "volume",
             "Trading_money": "turnover",
-        })[["date", "open", "high", "low", "close", "volume", "turnover"]]
+        })
+        # FinMind 目前就是照日期升冪回傳，但介面契約寫了「依日期升冪」就自己確保一次，
+        # 不要把正確性押在上游不會改行為上。日期是 "YYYY-MM-DD" 字串，字典序等同時間序。
+        raw = raw.sort_values("date")
 
-        div = self.fetch_dividends(stock_id, start, end)
-        if div.empty:
-            raw["adj_close"] = raw["close"]
-            return raw[columns].reset_index(drop=True)
-
-        div_for_adjust = div.rename(columns={"ex_date": "date"})
-        adjusted = calculate_adjusted_price(raw, div_for_adjust)
-        adjusted["date"] = adjusted["date"].dt.strftime("%Y-%m-%d")
-
-        return adjusted[columns].reset_index(drop=True)
+        return raw[columns].reset_index(drop=True)
