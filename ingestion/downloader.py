@@ -4,6 +4,7 @@
 
 import sqlite3
 from datetime import date, timedelta
+from typing import NamedTuple
 
 import pandas as pd
 from tqdm import tqdm
@@ -12,8 +13,36 @@ from .sources.base import PriceSource
 from config.settings import HISTORY_START_DATE
 
 
-def sync_stock_list(source: PriceSource, conn: sqlite3.Connection, universe: list[str]) -> int:
+class SyncResult(NamedTuple):
+    """sync_stock_list 的結果摘要。"""
+
+    synced: int                  # 寫進（新增或更新）stocks 表的檔數
+    deactivated: list[str]       # 這次新被標記為下市（is_active 由 1 改成 0）的股票
+
+
+class DownloadResult(NamedTuple):
+    """download_all 的結果摘要。
+
+    四種結局刻意分開放，不要只回傳成功的那些：orchestrator（步驟 22）要印摘要、
+    要把失敗記進 log，如果失敗清單只有 print 出來，上層就什麼都拿不到。
+
+    「呼叫成功但回傳 0 列」也單獨一類，不混進 data——它跟真的抓到資料是兩回事，
+    混在一起會讓摘要顯示「成功 N 檔」但其實什麼都沒抓到。
+    """
+
+    data: dict[str, pd.DataFrame]   # 成功且有抓到資料
+    empty: list[str]                # 呼叫成功但回傳 0 列（停牌、或區間內沒有交易日）
+    skipped: list[str]              # 根本沒打 API（沒有新資料要抓）
+    failed: dict[str, str]          # 抓取失敗，值是錯誤訊息
+
+
+def sync_stock_list(source: PriceSource, conn: sqlite3.Connection, universe: list[str]) -> SyncResult:
     """抓資料來源的股票清單，只保留 universe 內的股票，UPSERT 進 stocks 表。
+
+    universe 裡「資料來源清單中找不到」的股票會被標記成 is_active = 0。
+    這些通常是已下市、或代碼打錯的股票。不標記的話 is_active 永遠是 1，
+    分不出「還在市場上」跟「已經下市」，回測就會有存活者偏誤
+    （survivorship bias）——只用今天還活著的股票回測，績效會虛高。
 
     Args:
         source: 任一 PriceSource 實作（例如 FinMindSource）
@@ -21,14 +50,10 @@ def sync_stock_list(source: PriceSource, conn: sqlite3.Connection, universe: lis
         universe: 要保留的 stock_id 清單（例如 config.settings.SAMPLE_UNIVERSE）
 
     Returns:
-        實際寫入（新增或更新）的檔數
+        SyncResult(synced=寫入的檔數, deactivated=這次新標記為下市的股票)
     """
     stock_list = source.fetch_stock_list()
     filtered = stock_list[stock_list["stock_id"].isin(universe)]
-
-    missing = set(universe) - set(filtered["stock_id"])
-    if missing:
-        print(f"警告：universe 裡有 {len(missing)} 檔在資料來源清單裡找不到: {sorted(missing)}")
 
     rows = list(
         filtered[["stock_id", "name", "market", "industry", "listing_date"]]
@@ -49,8 +74,48 @@ def sync_stock_list(source: PriceSource, conn: sqlite3.Connection, universe: lis
         """,
         rows,
     )
+
+    missing = sorted(set(universe) - set(filtered["stock_id"]))
+    deactivated = _deactivate(conn, missing)
+
     conn.commit()
-    return len(rows)
+
+    if missing:
+        print(f"警告：universe 裡有 {len(missing)} 檔在資料來源清單裡找不到: {missing}")
+    if deactivated:
+        print(f"  其中 {len(deactivated)} 檔本來是上市中，已標記為下市: {deactivated}")
+
+    return SyncResult(synced=len(rows), deactivated=deactivated)
+
+
+def _deactivate(conn: sqlite3.Connection, stock_ids: list[str]) -> list[str]:
+    """把指定股票標記成下市（is_active = 0），回傳「這次真的被改到」的那些。
+
+    只挑目前 is_active = 1 的來改，所以重跑時不會每次都宣稱同一檔又下市了一次
+    ——回傳值代表的是「狀態變化」，不是「符合條件的全部」。
+    """
+    if not stock_ids:
+        return []
+
+    placeholders = ",".join("?" * len(stock_ids))
+    still_active = [
+        row[0] for row in conn.execute(
+            f"SELECT stock_id FROM stocks WHERE stock_id IN ({placeholders}) AND is_active = 1",
+            stock_ids,
+        )
+    ]
+    if not still_active:
+        return []
+
+    placeholders = ",".join("?" * len(still_active))
+    conn.execute(
+        f"""
+        UPDATE stocks SET is_active = 0, updated_at = datetime('now')
+        WHERE stock_id IN ({placeholders})
+        """,
+        still_active,
+    )
+    return still_active
 
 
 def plan_downloads(conn: sqlite3.Connection, universe: list[str]) -> dict[str, tuple[str, str]]:
@@ -94,25 +159,46 @@ def plan_downloads(conn: sqlite3.Connection, universe: list[str]) -> dict[str, t
     return plan
 
 
-def download_all(source: PriceSource, plan: dict[str, tuple[str, str]]) -> dict[str, pd.DataFrame]:
+def _has_possible_trading_day(start: str, end: str) -> bool:
+    """區間內有沒有可能開市的日子。
+
+    只排除週六日——國定假日還是會白打一次 API，要完全避免得等有交易日曆
+    （規劃書步驟 26 才會建）。但光是週末這一項，就能省下每個週末
+    「universe 檔數 × 每檔 3 次」的無謂呼叫。
+    """
+    first = date.fromisoformat(start)
+    last = date.fromisoformat(end)
+    if (last - first).days >= 6:      # 跨滿一週，一定包含平日，不用逐日檢查
+        return True
+
+    day = first
+    while day <= last:
+        if day.weekday() < 5:         # 0=週一 ... 4=週五
+            return True
+        day += timedelta(days=1)
+    return False
+
+
+def download_all(source: PriceSource, plan: dict[str, tuple[str, str]]) -> DownloadResult:
     """依照 plan_downloads 算出的區間，把每一檔股票的股價抓下來。
 
     這一步只負責「抓」，不寫進資料庫——先確認資料抓得對，
     之後再交給 cleaner -> validator -> loader 那條線處理。
 
-    - start > end（沒有新資料要抓）的股票直接跳過，不浪費 API 呼叫
+    - 沒有東西可抓的（start > end，或區間內全是週末）直接跳過，不浪費 API 呼叫
     - 單檔抓取失敗會被記錄下來並跳過，不會讓整批下載中斷
+    - 抓到 0 列的不算「成功」，另外歸到 empty
 
     Returns:
-        {stock_id: DataFrame}，只包含成功抓到資料的股票
-        （略過和失敗的清單會印出來，不會混進回傳值裡）
+        DownloadResult(data, empty, skipped, failed)
     """
     results: dict[str, pd.DataFrame] = {}
+    empty: list[str] = []
     skipped: list[str] = []
     failed: dict[str, str] = {}
 
     for stock_id, (start, end) in tqdm(plan.items(), desc="下載股價"):
-        if start > end:
+        if start > end or not _has_possible_trading_day(start, end):
             skipped.append(stock_id)
             continue
         try:
@@ -120,9 +206,17 @@ def download_all(source: PriceSource, plan: dict[str, tuple[str, str]]) -> dict[
         except Exception as e:
             failed[stock_id] = str(e)
             continue
+        if df.empty:
+            empty.append(stock_id)
+            continue
         results[stock_id] = df
 
-    print(f"下載完成: 成功 {len(results)} 檔, 略過 {len(skipped)} 檔（無新資料）, 失敗 {len(failed)} 檔")
+    print(
+        f"下載完成: 成功 {len(results)} 檔, 無資料 {len(empty)} 檔, "
+        f"略過 {len(skipped)} 檔（無新資料）, 失敗 {len(failed)} 檔"
+    )
+    if empty:
+        print(f"  無資料: {empty}")
     if skipped:
         print(f"  略過: {skipped}")
     if failed:
@@ -130,4 +224,4 @@ def download_all(source: PriceSource, plan: dict[str, tuple[str, str]]) -> dict[
         for stock_id, err in failed.items():
             print(f"    {stock_id}: {err}")
 
-    return results
+    return DownloadResult(data=results, empty=empty, skipped=skipped, failed=failed)

@@ -1,15 +1,15 @@
 import sys
-import sqlite3
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from config.settings import DATABASE_PATH, BASE_DIR
+from database.connection import get_connection
 
 SCHEMA_PATH = BASE_DIR / "database" / "schema.sql"
 
 
 def init_db():
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = get_connection()
     with open(SCHEMA_PATH, encoding="utf-8") as f:
         conn.executescript(f.read())
     conn.commit()
