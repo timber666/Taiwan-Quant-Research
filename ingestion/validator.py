@@ -40,6 +40,21 @@ OHLC_RULES = [
 ]
 
 
+def _as_bool(mask: pd.Series) -> pd.Series:
+    """把可空布林（pandas 的 boolean dtype）壓成純 bool，缺值一律當作「沒命中」。
+
+    cleaner 的 volume 是 Int64（可空整數），對它做 `volume < 0` 拿到的是 boolean
+    dtype，缺值的位置是 pd.NA 而不是 False。這種遮罩帶進後面的邏輯會出事：
+    `False | pd.NA` 等於 pd.NA、`~pd.NA` 還是 pd.NA，而 pandas 的布林索引把 NA
+    當成 False——於是那一列既不會留在 good_df，也不會被記進 bad_df，
+    **整列無聲無息地消失**。實測就是這樣掉了一列（成交量缺值的那天）。
+
+    缺值的語意是「這條規則無法判斷」，不是「違規」，所以當成沒有命中。
+    統一套在每一條規則上，之後新增規則時也不用再想這件事。
+    """
+    return mask.fillna(False).astype(bool)
+
+
 def _price_jump_mask(df: pd.DataFrame, ex_dates: set) -> pd.Series:
     """標出單日漲跌幅過大的列，但跳過除權息日。
 
@@ -131,6 +146,7 @@ def validate(df: pd.DataFrame, ex_dates=None) -> tuple[pd.DataFrame, pd.DataFram
     rejected = pd.Series(False, index=work.index)
     flagged = []
     for reason, mask, fatal in checks:
+        mask = _as_bool(mask)
         if fatal:
             rejected |= mask
         if mask.any():
