@@ -137,6 +137,34 @@ def test_non_positive_price_is_rejected():
     assert good.empty
 
 
+def test_zero_open_alone_is_flagged_but_the_day_is_kept():
+    """只有 open 是 0、收高低與成交量都正常時，那一天要留下來。
+
+    真實案例：6861 睿生光電 2021-11-30（上市首日）、6919 康霈 2024-03-29
+    （停牌 12 天後復牌）——這兩天沒有開盤參考價所以 open 是 0，
+    但都是真的有成交的交易日（41 萬股、142 萬股）。
+    回測用的是 close，為了一個 open 把整天丟掉會在序列中間開洞。
+    """
+    df = frame([row("2024-03-29", open=0.0, high=266.5, low=240.5, close=257.0)])
+
+    good, bad = validate(df)
+
+    assert dates_in(good) == {"2024-03-29"}                  # 留下來了
+    assert "non_positive_open" in reasons_on(bad, "2024-03-29")   # 但有記一筆備查
+    assert "non_positive_price" not in reasons_on(bad, "2024-03-29")
+
+
+def test_all_zero_row_is_not_double_counted():
+    """完全沒成交的那種全 0 列只報 non_positive_price，不要連 open 那條也報一次。
+
+    同一件事記兩遍會讓步驟 26 的 quarantine 分布統計失真。
+    """
+    good, bad = validate(frame([row("2024-03-11", open=0.0, high=0.0, low=0.0, close=0.0)]))
+
+    assert good.empty
+    assert reasons_on(bad, "2024-03-11") == {"non_positive_price"}
+
+
 def test_negative_volume_is_rejected():
     good, bad = validate(frame([row("2024-03-11", volume=-5)]))
 
@@ -264,6 +292,21 @@ def test_zero_previous_close_does_not_blow_up():
 
     assert "price_jump" not in set(bad["reason"])
     assert "non_positive_price" in set(bad["reason"])      # 0 元那列本身還是要擋
+
+
+def test_zero_close_day_is_not_flagged_as_a_price_jump():
+    """無成交日的 close 是 0，「昨天 39 元、今天 0 元」不是跳空，是那天沒有價格。
+
+    那一列已經被 non_positive_price 擋掉、不會寫進 prices，再標一次 price_jump
+    只是把同一個問題記兩遍。實測 44 筆 price_jump 裡有 36 筆是這樣來的。
+    """
+    df = frame([row("2024-03-11", close=39.0), row("2024-03-12", close=0.0,
+                                                   open=0.0, high=0.0, low=0.0)])
+
+    bad = validate(df)[1]
+
+    assert "price_jump" not in reasons_on(bad, "2024-03-12")
+    assert "non_positive_price" in reasons_on(bad, "2024-03-12")   # 該擋的還是要擋
 
 
 def test_price_jump_follows_date_order_not_row_order():

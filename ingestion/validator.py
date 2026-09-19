@@ -25,6 +25,14 @@ PRICE_JUMP_THRESHOLD = 0.15
 
 PRICE_FIELDS = ["open", "high", "low", "close"]
 
+# 「沒有這個價格就等於沒有這一天」的欄位。open 刻意不在裡面——理由跟 OHLC_RULES
+# 那兩條 open 規則一樣：上市首日與停牌復牌當天沒有開盤參考價，FinMind 會填 0，
+# 但那天是真的有成交的。實測到三天被整列丟掉：6861 睿生光電 2021-11-30（上市首日，
+# 成交 41 萬股）、6919 康霈 2022-12-26（上市首日，767 萬股）與 2024-03-29
+# （停牌 12 天後復牌，142 萬股），三天的 high/low/close/volume 全都正常，
+# 只有 open 是 0。回測用的是 close，為了一個 open 把整天丟掉並不划算。
+FATAL_PRICE_FIELDS = ["high", "low", "close"]
+
 # cleaner.clean() 的輸出欄位，validator 直接接在它後面
 REQUIRED_COLUMNS = ["stock_id", "date", "open", "high", "low", "close", "volume"]
 
@@ -82,7 +90,14 @@ def _price_jump_mask(df: pd.DataFrame, ex_dates: set) -> pd.Series:
     prev_close = ordered["close"].shift(1)
 
     # prev_close 為 0 或缺值時不計算，否則會得到 inf。第一列沒有前一日，同樣跳過。
-    comparable = prev_close.notna() & (prev_close > 0)
+    #
+    # 當日 close 為 0 也要排除。無成交日的 close 是 0，「昨天 39 元、今天 0 元」
+    # 會被算成 -100% 的跳空，但那不是價格異常，是那天根本沒有價格——而且那一列
+    # 已經被 non_positive_price 擋掉了，不會寫進 prices，再標一次 price_jump
+    # 只是把同一個問題記兩遍。實測：44 筆 price_jump 裡有 36 筆是這樣來的假訊號，
+    # 真正需要人判斷的只有 8 筆。quarantine 的定位是「人應該看一眼的東西」，
+    # 被 82% 的雜訊稀釋掉就失去意義了。
+    comparable = prev_close.notna() & (prev_close > 0) & (ordered["close"] > 0)
     change = (ordered["close"] - prev_close).abs() / prev_close
     jumped = comparable & (change > PRICE_JUMP_THRESHOLD)
 
@@ -136,10 +151,18 @@ def validate(df: pd.DataFrame, ex_dates=None) -> tuple[pd.DataFrame, pd.DataFram
     for reason, rule, fatal in OHLC_RULES:
         checks.append((reason, complete & rule(work), fatal))
 
+    # 收高低價任一個 <= 0 -> 這天沒有可用的價格，致命。
+    fatal_price = complete & (work[FATAL_PRICE_FIELDS] <= 0).any(axis=1)
+    checks.append(("non_positive_price", fatal_price, True))
+
+    # open <= 0 單獨一條，而且只標記不隔離。
+    # 加上 ~fatal_price 是為了不要重複記帳：全 0 的無成交日（收高低也是 0）已經被
+    # 上面那條擋下來了，再記一筆 non_positive_open 只是同一件事講兩遍，
+    # 會讓步驟 26 的 quarantine 分布統計失真。這裡要抓的是「只有 open 有問題」。
     checks.append((
-        "non_positive_price",
-        complete & (work[PRICE_FIELDS] <= 0).any(axis=1),
-        True,
+        "non_positive_open",
+        complete & ~fatal_price & (work["open"] <= 0),
+        False,
     ))
 
     # 刻意寫成 volume < 0 而不是 not (volume >= 0)：後者會把缺值也算進來，
