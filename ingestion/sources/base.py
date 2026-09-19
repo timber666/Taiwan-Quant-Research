@@ -52,6 +52,22 @@ class PriceSource(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def fetch_corporate_actions(self, stock_id: str, start: str, end: str) -> pd.DataFrame:
+        """抓取單一股票在區間內的減資與面額變更事件。
+
+        回傳欄位：ex_date, action_type, before_price, after_price, note
+        對齊 database/schema.sql 的 corporate_actions 表。
+
+        - action_type：'capital_reduction'（減資）或 'split'（面額變更）
+        - before_price / after_price：官方公告的事件前收盤價與事件後參考價，
+          兩者相除就是還原價要用的調整因子
+
+        跟除權息一樣，這些事件會讓股價跳空但不代表真的漲跌，不還原的話回測會把
+        2609 陽明 2017 年的減資看成一天暴漲 116%。
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def fetch_dividends(self, stock_id: str, start: str, end: str) -> pd.DataFrame:
         """抓取單一股票在區間內的除權息事件。
 

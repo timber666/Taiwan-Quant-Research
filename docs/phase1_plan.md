@@ -20,7 +20,7 @@
 - [x] 階段 A：前置設定與資料來源評估（步驟 1〜6）
 - [x] 階段 B：資料庫 Schema 重設計（步驟 7〜10）
 - [x] 階段 C：Downloader（步驟 11〜15）
-- [ ] 階段 D：Cleaner + Validator + Loader（步驟 16〜23）
+- [x] 階段 D：Cleaner + Validator + Loader（步驟 16〜23）
 - [ ] 階段 E：資料存取層 + EDA + 驗收（步驟 24〜30）
 
 > 建議每完成 1〜2 步就 `git commit` 一次，訊息像
@@ -455,8 +455,10 @@
   def get_price_matrix(stock_ids, field="adj_close", start=None, end=None) -> pd.DataFrame
   # get_price_matrix: index=date, columns=stock_id
   ```
-  `adjusted=True` 時：撈原始價 → 撈該股的 `dividend_events` →
-  用 `ingestion/adjustment.py` 的 `calculate_adjusted_price` 算出 `adj_close`。
+  `adjusted=True` 時：撈原始價 → 撈該股的 `dividend_events` **與 `corporate_actions`**
+  → 用 `ingestion/adjustment.py` 的 `calculate_adjusted_price` 算出 `adj_close`。
+  兩張表都要撈：除權息以外，減資與面額變更同樣會讓股價跳空（2609 陽明 2017 年的
+  減資若不還原，回測會看成一天暴漲 116%），詳見 `docs/data_source.md`。
   全部走 `config.settings.DATABASE_PATH`。
 - **⚠️ 最容易錯的地方**：要套用的事件是「`ex_date` 晚於查詢區間起點的**全部**事件」，
   **不能被查詢的 `end` 限制住**。例如 `get_prices("2330", "2020-01-01", "2020-12-31")`
@@ -519,9 +521,10 @@
 - [ ] `requirements.txt` 正常編碼、含 FinMind
 - [ ] `docs/data_source.md`（來源評估 + 還原股價說明）
 - [ ] `database/schema.sql`：stocks / prices(只存原始價) / dividend_events /
-      ingest_log / data_quarantine(有主鍵)
+      corporate_actions / ingest_log / data_quarantine(有主鍵)
 - [ ] `database/init_db.py`：只建表、冪等、走 settings 路徑
-- [ ] `ingestion/`：base、finmind_source、downloader、cleaner、validator、loader、run_ingest
+- [ ] `ingestion/`：base、finmind_source、adjustment、downloader、cleaner、validator、
+      loader、run_ingest
 - [ ] `tests/`：adjustment、cleaner、validator、loader、data_access 測試全綠
 - [ ] `database/data_access.py`：get_prices / get_universe / get_price_matrix
       （還原價在這層即時計算）

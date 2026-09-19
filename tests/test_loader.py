@@ -18,7 +18,8 @@ from config.settings import BASE_DIR
 from database.connection import get_connection
 from ingestion.cleaner import PRICE_COLUMNS, clean
 from ingestion.loader import (
-    quarantine, update_ingest_log, upsert_dividends, upsert_prices,
+    quarantine, update_ingest_log, upsert_corporate_actions,
+    upsert_dividends, upsert_prices,
 )
 from ingestion.validator import validate
 
@@ -189,6 +190,51 @@ def test_missing_reference_price_is_stored_as_null(conn):
 def test_empty_dividend_frame_writes_nothing(conn):
     """大多數股票在大多數區間裡都沒有除權息，這是最常見的路徑"""
     assert upsert_dividends(conn, "2330", dividend_frame([])) == (0, 0)
+
+
+# ---------------------------------------------------------------------------
+# upsert_corporate_actions
+# ---------------------------------------------------------------------------
+
+def action_frame(rows):
+    return pd.DataFrame(
+        rows, columns=["ex_date", "action_type", "before_price", "after_price", "note"]
+    )
+
+
+def test_corporate_actions_are_written(conn):
+    df = action_frame([{"ex_date": "2017-05-04", "action_type": "capital_reduction",
+                        "before_price": 6.15, "after_price": 13.16, "note": "Making up losses"}])
+
+    result = upsert_corporate_actions(conn, "2330", df)
+
+    assert result == (1, 0)
+    row = conn.execute(
+        "SELECT stock_id, ex_date, action_type, before_price, after_price FROM corporate_actions"
+    ).fetchone()
+    assert row == ("2330", "2017-05-04", "capital_reduction",
+                   pytest.approx(6.15), pytest.approx(13.16))
+
+
+def test_corporate_actions_are_idempotent(conn):
+    df = action_frame([{"ex_date": "2017-05-04", "action_type": "capital_reduction",
+                        "before_price": 6.15, "after_price": 13.16, "note": None}])
+    upsert_corporate_actions(conn, "2330", df)
+
+    assert upsert_corporate_actions(conn, "2330", df) == (0, 1)
+    assert conn.execute("SELECT COUNT(*) FROM corporate_actions").fetchone()[0] == 1
+
+
+def test_reduction_and_split_on_the_same_day_are_separate_rows(conn):
+    """主鍵含 action_type：同一天發生兩種公司行動時兩筆都要留著，不能互相覆蓋"""
+    df = action_frame([
+        {"ex_date": "2024-03-12", "action_type": "capital_reduction",
+         "before_price": 100.0, "after_price": 200.0, "note": None},
+        {"ex_date": "2024-03-12", "action_type": "split",
+         "before_price": 200.0, "after_price": 100.0, "note": None},
+    ])
+
+    assert upsert_corporate_actions(conn, "2330", df) == (2, 0)
 
 
 # ---------------------------------------------------------------------------

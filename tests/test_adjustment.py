@@ -30,8 +30,8 @@ def price_frame(rows):
     ])
 
 
-def adjusted_close(df_price, df_div):
-    out = calculate_adjusted_price(df_price, df_div)
+def adjusted_close(df_price, df_div, df_actions=None):
+    out = calculate_adjusted_price(df_price, df_div, df_actions)
     return out.assign(date=out["date"].dt.strftime("%Y-%m-%d")).set_index("date")["adj_close"]
 
 
@@ -75,6 +75,64 @@ def test_large_stock_dividend_matches_official_reference_price():
 
     assert adj["2026-09-01"] == pytest.approx(2614.99, abs=0.05)
     assert adj["2026-09-02"] == pytest.approx(2610.0)
+
+
+# ---------------------------------------------------------------------------
+# 減資與面額變更（步驟 23 實跑後才發現漏掉的一整類事件）
+# ---------------------------------------------------------------------------
+
+def test_capital_reduction_is_adjusted():
+    """2609 陽明 2017-05-04 減資（彌補虧損），官方公告 6.15 -> 13.16。
+
+    不還原的話，回測會把這天看成一天暴漲 116%——那是股數變少造成的，
+    持有人的資產並沒有變多。這是步驟 23 的 price_jump 標記把它揪出來的。
+    """
+    prices = price_frame([("2017-05-03", 6.15), ("2017-05-04", 13.15)])
+    actions = pd.DataFrame([{"date": "2017-05-04", "before_price": 6.15, "after_price": 13.16}])
+
+    adj = adjusted_close(price_frame([("2017-05-03", 6.15), ("2017-05-04", 13.15)]),
+                         pd.DataFrame(columns=DIV_COLUMNS), actions)
+
+    assert adj["2017-05-03"] == pytest.approx(13.16, abs=0.01)   # 歷史價往上調
+    assert adj["2017-05-04"] == pytest.approx(13.15)             # 事件當天不動
+    assert abs(adj.pct_change().iloc[-1]) < 0.01                 # 還原後幾乎沒有漲跌
+
+
+def test_par_value_split_is_adjusted():
+    """6919 康霈 2025-07-21 面額變更，官方公告 1215 -> 121.5（十分之一）。
+
+    方向跟減資相反：股數變多、每股價格變低，歷史價要往下調。
+    """
+    actions = pd.DataFrame([{"date": "2025-07-21", "before_price": 1215.0, "after_price": 121.5}])
+
+    adj = adjusted_close(price_frame([("2025-07-18", 1215.0), ("2025-07-21", 121.5)]),
+                         pd.DataFrame(columns=DIV_COLUMNS), actions)
+
+    assert adj["2025-07-18"] == pytest.approx(121.5)
+    assert adj["2025-07-21"] == pytest.approx(121.5)
+
+
+def test_dividend_and_action_on_the_same_day_are_multiplied():
+    """同一天又除息又減資時，兩個因子要相乘，不是只取其中一個"""
+    divs = pd.DataFrame([{"date": "2024-03-12", "cash_div": 10.0, "stock_div": 0.0}])
+    actions = pd.DataFrame([{"date": "2024-03-12", "before_price": 100.0, "after_price": 200.0}])
+
+    adj = adjusted_close(price_frame([("2024-03-11", 100.0), ("2024-03-12", 180.0)]),
+                         divs, actions)
+
+    # 除息因子 (100-10)/100 = 0.9，減資因子 200/100 = 2.0，相乘 1.8
+    assert adj["2024-03-11"] == pytest.approx(180.0)
+
+
+def test_no_actions_is_the_same_as_none():
+    """絕大多數股票沒有任何公司行動，傳 None 或空表都不該改變結果"""
+    prices = price_frame([("2024-03-11", 100.0), ("2024-03-12", 100.0)])
+    divs = pd.DataFrame([{"date": "2024-03-12", "cash_div": 10.0, "stock_div": 0.0}])
+
+    baseline = adjusted_close(prices, divs)
+    empty = pd.DataFrame(columns=["date", "before_price", "after_price"])
+
+    assert list(adjusted_close(prices, divs, empty)) == list(baseline)
 
 
 # ---------------------------------------------------------------------------

@@ -60,6 +60,29 @@ CREATE TABLE IF NOT EXISTS data_quarantine (
 -- notebooks/_spike_datasource.ipynb 的還原股價驗證結果加的。
 -- 階段 D 步驟 16 之後它的地位又更重要了：prices 不再存 adj_close，
 -- 這張表是計算還原價的**唯一**資料來源，也是事後稽核「某天的折價是怎麼來的」的依據。
+-- 除權息以外、同樣會讓股價「跳空但不是真的漲跌」的公司行動：減資與面額變更。
+-- 這張表是步驟 23 實跑後才加的：當時 validator 的 price_jump 標記出 18 筆大跳空，
+-- 逐一查證後發現其中 11 筆是減資或面額變更（例如 2609 陽明 2017-05-04 從 6.15
+-- 變成 13.16、6919 康霈 2025-07-21 從 1215 變成 121.5），它們完全不在
+-- dividend_events 裡，等於這些股票的還原價會是錯的——跟一開始修掉的除權息問題
+-- 是同一類錯誤，只是來源不同。
+--
+-- 跟 dividend_events 分開存，是因為調整方式不一樣：除權息要用證交所公式從股利
+-- 算出參考價，這裡則是官方直接公告「事件前收盤價」與「事件後參考價」，
+-- 兩者相除就是調整因子，不需要也不該自己再推導一次。
+CREATE TABLE IF NOT EXISTS corporate_actions (
+    stock_id     TEXT NOT NULL,
+    ex_date      TEXT NOT NULL,            -- 減資恢復買賣日 / 面額變更生效日
+    action_type  TEXT NOT NULL,            -- 'capital_reduction' | 'split'
+    before_price REAL NOT NULL,            -- 官方公告的事件前收盤價
+    after_price  REAL NOT NULL,            -- 官方公告的事件後參考價
+    note         TEXT,                     -- 減資原因 / 分割類型
+    source       TEXT,
+    ingested_at  TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (stock_id, ex_date, action_type),
+    FOREIGN KEY (stock_id) REFERENCES stocks(stock_id)
+);
+
 CREATE TABLE IF NOT EXISTS dividend_events (
     stock_id        TEXT NOT NULL,
     ex_date         TEXT NOT NULL,            -- 除權息交易日

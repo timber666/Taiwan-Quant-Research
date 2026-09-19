@@ -28,15 +28,24 @@ PRICE_FIELDS = ["open", "high", "low", "close"]
 # cleaner.clean() 的輸出欄位，validator 直接接在它後面
 REQUIRED_COLUMNS = ["stock_id", "date", "open", "high", "low", "close", "volume"]
 
-# OHLC 之間的大小關係。拆成五條各自命名而不是合併成一條 "ohlc_inconsistent"，
-# 是因為步驟 26 的 EDA 要看「各 reason 幾筆」——知道是 high < low 還是 high < close
-# 對追查來源問題的價值完全不同。
+# OHLC 之間的大小關係，(reason, 判斷式, 是否致命)。
+# 拆成五條各自命名而不是合併成一條 "ohlc_inconsistent"，是因為步驟 26 的 EDA 要看
+# 「各 reason 幾筆」——知道是 high < low 還是 high < close，對追查來源問題的價值完全不同。
+#
+# **跟 open 有關的兩條只標記、不隔離。** 步驟 23 實跑後發現它們擋掉了 392 天的資料，
+# 而且全部集中在 4 檔股票的興櫃時期（6446 藥華藥、6919 康霈、6861 睿生光電、
+# 6442 光聖，各自上市之後就再也沒發生）。興櫃是議價成交、沒有集合競價，FinMind 的
+# open 跟 high/low 不是同一套口徑（那段期間的報價像 138.64 這種不符合台股跳動單位的
+# 數字），所以 open 會落在 [low, high] 之外。
+# 但那些列的 close/high/low 本身是合理的，而回測用的是 close——為了一個對不上的 open
+# 把整天丟掉，會在序列中間開洞（6919 一度少掉 13.4% 的交易日），
+# 而缺一天會讓 t-1 到 t+1 被當成一天的報酬，比留著一個怪的 open 危險得多。
 OHLC_RULES = [
-    ("high_lt_low", lambda d: d["high"] < d["low"]),
-    ("high_lt_open", lambda d: d["high"] < d["open"]),
-    ("high_lt_close", lambda d: d["high"] < d["close"]),
-    ("low_gt_open", lambda d: d["low"] > d["open"]),
-    ("low_gt_close", lambda d: d["low"] > d["close"]),
+    ("high_lt_low", lambda d: d["high"] < d["low"], True),
+    ("high_lt_close", lambda d: d["high"] < d["close"], True),
+    ("low_gt_close", lambda d: d["low"] > d["close"], True),
+    ("high_lt_open", lambda d: d["high"] < d["open"], False),
+    ("low_gt_open", lambda d: d["low"] > d["open"], False),
 ]
 
 
@@ -62,9 +71,12 @@ def _price_jump_mask(df: pd.DataFrame, ex_dates: set) -> pd.Series:
     （-66%）、2409 友達每年除息也都會觸發。那些不是資料有問題，是市場的正常行為。
     不排除的話，quarantine 會被除權息洗版，真正需要人看的異常反而被埋掉。
 
-    ex_dates 由 run_ingest 從剛抓到的除權息事件傳進來（步驟 23）。
-    減資、面額變更不在 dividend_events 裡，所以還是會被標記——那是對的，
-    那些確實需要人看一眼。
+    ex_dates 由 run_ingest 傳進來，包含除權息交易日與減資 / 面額變更日
+    （後者是步驟 23 實跑後才補上的：當時 price_jump 標出 18 筆大跳空，
+    查證後有 11 筆是減資或面額變更，例如 2609 陽明 2017-05-04 的 +116%）。
+
+    剩下會被標記的，就是真正只能靠人判斷的：興櫃時期沒有漲跌幅限制的大波動，
+    以及尚未納入的其他公司行動。
     """
     ordered = df.sort_values("date")
     prev_close = ordered["close"].shift(1)
@@ -86,9 +98,9 @@ def validate(df: pd.DataFrame, ex_dates=None) -> tuple[pd.DataFrame, pd.DataFram
 
     Args:
         df: cleaner.clean() 的輸出
-        ex_dates: 這檔股票的除權息交易日（"YYYY-MM-DD" 字串的集合）。
-            這些日子不做 price_jump 檢查。傳 None 代表不知道除權息日，
-            那些跳空就會全部被標記出來。
+        ex_dates: 這檔股票「已知會跳空」的日子（"YYYY-MM-DD" 字串的集合），
+            包含除權息交易日與減資 / 面額變更日。這些日子不做 price_jump 檢查。
+            傳 None 代表不知道，那些跳空就會全部被標記出來。
 
     Returns:
         (good_df, bad_df)
@@ -121,8 +133,8 @@ def validate(df: pd.DataFrame, ex_dates=None) -> tuple[pd.DataFrame, pd.DataFram
     # (reason, 命中的列, 是否致命)
     checks = [("missing_price", ~complete, True)]
 
-    for reason, rule in OHLC_RULES:
-        checks.append((reason, complete & rule(work), True))
+    for reason, rule, fatal in OHLC_RULES:
+        checks.append((reason, complete & rule(work), fatal))
 
     checks.append((
         "non_positive_price",

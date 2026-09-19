@@ -31,6 +31,9 @@ from .cleaner import PRICE_COLUMNS, DEFAULT_SOURCE
 # PriceSource.fetch_dividends 的回傳欄位
 DIVIDEND_COLUMNS = ["ex_date", "cash_div", "stock_div", "reference_price"]
 
+# PriceSource.fetch_corporate_actions 的回傳欄位
+ACTION_COLUMNS = ["ex_date", "action_type", "before_price", "after_price", "note"]
+
 
 class UpsertResult(NamedTuple):
     """寫入結果。分開回報是為了讓步驟 23 的摘要能講「新增 X 列 / 更新 Y 列」——
@@ -150,6 +153,40 @@ def upsert_dividends(
         rows,
     )
     inserted = _count(conn, "dividend_events") - before
+    return UpsertResult(inserted, len(df) - inserted)
+
+
+def upsert_corporate_actions(
+    conn: sqlite3.Connection, stock_id: str, df: pd.DataFrame, source: str = DEFAULT_SOURCE
+) -> UpsertResult:
+    """把減資與面額變更寫進 corporate_actions。
+
+    跟 dividend_events 一樣，這是步驟 24 算還原價的輸入。兩張表分開是因為調整方式
+    不同：除權息要用證交所公式從股利推參考價，這裡的參考價是官方直接公告的。
+
+    Args:
+        df: PriceSource.fetch_corporate_actions 的回傳，欄位為 ACTION_COLUMNS
+    """
+    if df.empty:
+        return UpsertResult(0, 0)
+
+    before = _count(conn, "corporate_actions")
+    rows = [(stock_id, *values, source) for values in _rows(df, ACTION_COLUMNS)]
+    conn.executemany(
+        """
+        INSERT INTO corporate_actions
+            (stock_id, ex_date, action_type, before_price, after_price, note, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(stock_id, ex_date, action_type) DO UPDATE SET
+            before_price = excluded.before_price,
+            after_price  = excluded.after_price,
+            note         = excluded.note,
+            source       = excluded.source,
+            ingested_at  = datetime('now')
+        """,
+        rows,
+    )
+    inserted = _count(conn, "corporate_actions") - before
     return UpsertResult(inserted, len(df) - inserted)
 
 

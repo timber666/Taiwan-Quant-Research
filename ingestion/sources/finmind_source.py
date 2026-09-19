@@ -70,6 +70,9 @@ class FinMindSource(PriceSource):
     def __init__(self, api_token: str):
         self.dl = DataLoader()
         self.dl.login_by_token(api_token=api_token)
+        # 面額變更的 API 不吃 stock_id，一次回傳全市場（2015 年至今整個市場也才 35 筆）。
+        # 逐檔呼叫等於把同一份資料抓 38 次，所以照查詢區間快取起來，之後自己濾。
+        self._split_cache: dict[tuple[str, str], pd.DataFrame] = {}
 
     def fetch_stock_list(self) -> pd.DataFrame:
         info = _call_with_retry(self.dl.taiwan_stock_info)
@@ -167,6 +170,56 @@ class FinMindSource(PriceSource):
             div["reference_price"] = None
 
         return div[columns].reset_index(drop=True)
+
+    def _market_splits(self, start: str, end: str) -> pd.DataFrame:
+        """全市場的面額變更，同一個查詢區間只打一次 API。"""
+        key = (start, end)
+        if key not in self._split_cache:
+            self._split_cache[key] = _call_with_retry(
+                self.dl.taiwan_stock_split_price, start_date=start, end_date=end
+            )
+        return self._split_cache[key]
+
+    def fetch_corporate_actions(self, stock_id: str, start: str, end: str) -> pd.DataFrame:
+        columns = ["ex_date", "action_type", "before_price", "after_price", "note"]
+        frames = []
+
+        # 減資：不帶 stock_id 的全市場查詢需要付費會員（實測回 "Your level is register"），
+        # 所以只能逐檔問。
+        reduction = _call_with_retry(
+            self.dl.taiwan_stock_capital_reduction_reference_price,
+            stock_id=stock_id, start_date=start, end_date=end,
+        )
+        if not reduction.empty:
+            frames.append(pd.DataFrame({
+                "ex_date": reduction["date"],
+                "action_type": "capital_reduction",
+                # PostReductionReferencePrice 是正式的減資後參考價；
+                # OpeningReferencePrice 是再取到跳動單位的開盤競價基準，用前者比較精確。
+                "before_price": reduction["ClosingPriceonTheLastTradingDay"],
+                "after_price": reduction["PostReductionReferencePrice"],
+                "note": reduction["ReasonforCapitalReduction"],
+            }))
+
+        splits = self._market_splits(start, end)
+        if not splits.empty:
+            mine = splits[splits["stock_id"] == stock_id]
+            if not mine.empty:
+                frames.append(pd.DataFrame({
+                    "ex_date": mine["date"],
+                    "action_type": "split",
+                    "before_price": mine["before_price"],
+                    "after_price": mine["after_price"],
+                    "note": mine["type"],
+                }))
+
+        if not frames:
+            return pd.DataFrame(columns=columns)
+
+        actions = pd.concat(frames, ignore_index=True)
+        # before_price 之後要當除數，0 或缺值算不出因子，留著只會產生 inf/NaN
+        actions = actions[actions["before_price"] > 0]
+        return actions[columns].sort_values("ex_date").reset_index(drop=True)
 
     def fetch_prices(self, stock_id: str, start: str, end: str) -> pd.DataFrame:
         """原始日線，不含還原價（理由見模組 docstring 與 base.PriceSource）。"""

@@ -11,7 +11,9 @@
 import pandas as pd
 
 
-def calculate_adjusted_price(df_price: pd.DataFrame, df_div: pd.DataFrame) -> pd.DataFrame:
+def calculate_adjusted_price(
+    df_price: pd.DataFrame, df_div: pd.DataFrame, df_actions: pd.DataFrame = None
+) -> pd.DataFrame:
     """用除權息事件計算還原股價（後還原：最新一天價格不變，把歷史價格往下折算）。
 
     Args:
@@ -19,6 +21,8 @@ def calculate_adjusted_price(df_price: pd.DataFrame, df_div: pd.DataFrame) -> pd
         df_div: 至少要有 date（除權息交易日）, cash_div（現金股利/每股）,
             stock_div（股票股利/每 10 股配股數）欄位。
             同一天出現多筆事件會自動加總，呼叫端不必自己先合併。
+        df_actions: 減資與面額變更事件，要有 date, before_price, after_price 欄位。
+            可以是 None 或空表（多數股票本來就沒有）。
 
     Returns:
         df_price 加上 adj_open/adj_high/adj_low/adj_close 欄位的 DataFrame，
@@ -30,6 +34,12 @@ def calculate_adjusted_price(df_price: pd.DataFrame, df_div: pd.DataFrame) -> pd
         每一天的累積因子 = 該日期「之後」所有事件因子的累乘（嚴格大於，
         事件當天自己不能算進去，否則當天價格會被多打一次折——這是我們
         在 notebooks/_spike_datasource.ipynb 實測 6669 時抓到的 bug）
+
+    減資與面額變更的因子不用上面的公式推導，直接取官方公告的
+    `after_price / before_price`——官方已經把參考價算好了，自己再推一次只是多一個
+    出錯的機會。除權息因子偏小（< 1，把歷史價往下折），減資因子偏大（> 1，
+    把歷史價往上調，因為減資後股數變少、每股價格變高）。
+    同一天若同時有除權息與公司行動，兩個因子相乘。
     """
     df = df_price.copy()
     df["date"] = pd.to_datetime(df["date"])
@@ -60,6 +70,8 @@ def calculate_adjusted_price(df_price: pd.DataFrame, df_div: pd.DataFrame) -> pd
     df["adj_factor"] = 1.0
     df.loc[is_event, "adj_factor"] = p_ref / df["prev_close"]
 
+    df = _apply_action_factors(df, df_actions)
+
     # 事件當天的 factor 只影響「更早」的日期，不影響自己（shift(-1) 是修正 bug 的關鍵）
     shifted = df["adj_factor"].shift(-1).fillna(1.0)
     df["cum_factor"] = shifted.iloc[::-1].cumprod().iloc[::-1]
@@ -68,3 +80,30 @@ def calculate_adjusted_price(df_price: pd.DataFrame, df_div: pd.DataFrame) -> pd
         df[f"adj_{col}"] = (df[col] * df["cum_factor"]).round(2)
 
     return df.drop(columns=["cash_div", "stock_div", "prev_close", "split_ratio", "adj_factor", "cum_factor"])
+
+
+def _apply_action_factors(df: pd.DataFrame, df_actions: pd.DataFrame) -> pd.DataFrame:
+    """把減資 / 面額變更的因子乘進 adj_factor。
+
+    這些事件的調整因子不用證交所的除權息公式推導，直接取官方公告的
+    after_price / before_price。理由是官方已經把參考價算好了，而減資的公式還要
+    知道減資比率與每股退還金額，自己再推一次只是多一個出錯的機會。
+    """
+    if df_actions is None or df_actions.empty:
+        return df
+
+    act = df_actions[["date", "before_price", "after_price"]].copy()
+    act["date"] = pd.to_datetime(act["date"])
+    act = act[act["before_price"] > 0]
+    if act.empty:
+        return df
+
+    act["action_factor"] = act["after_price"] / act["before_price"]
+    # 同一天若有多筆（例如減資與面額變更一起），因子相乘；跟除權息那邊用 sum 合併
+    # 不同，是因為這裡合併的是「比例」不是「金額」。
+    act = act.groupby("date", as_index=False)["action_factor"].prod()
+
+    df = df.merge(act, on="date", how="left")
+    df["action_factor"] = pd.to_numeric(df["action_factor"], errors="coerce").fillna(1.0)
+    df["adj_factor"] *= df["action_factor"]
+    return df.drop(columns=["action_factor"])

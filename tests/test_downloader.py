@@ -47,6 +47,11 @@ class FakeSource(PriceSource):
     def fetch_dividends(self, stock_id, start, end):
         return pd.DataFrame(columns=["ex_date", "cash_div", "stock_div", "reference_price"])
 
+    def fetch_corporate_actions(self, stock_id, start, end):
+        return pd.DataFrame(
+            columns=["ex_date", "action_type", "before_price", "after_price", "note"]
+        )
+
 
 def price_frame(dates):
     return pd.DataFrame([

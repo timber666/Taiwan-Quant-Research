@@ -90,28 +90,43 @@ def test_high_lower_than_low_is_rejected():
     assert good.empty                                   # 致命 -> 不寫進 prices
 
 
-def test_high_lower_than_open_is_rejected():
-    bad = validate(frame([row("2024-03-11", high=99.5, open=100.0, low=99.0)]))[1]
+def test_high_lower_than_open_is_flagged_but_kept():
+    """open 對不上只標記、不隔離——理由見 validator.OHLC_RULES 的註解。
 
-    assert "high_lt_open" in reasons_on(bad, "2024-03-11")
+    這種列的 close/high/low 本身是合理的，而回測用的是 close。
+    為了一個怪的 open 把整天丟掉，會在序列中間開洞，
+    而缺一天會讓 t-1 到 t+1 被當成一天的報酬，比留著那個 open 危險得多。
+    """
+    # close/high/low 彼此相容，只有 open 落在區間外——這正是興櫃報價的形狀
+    good, bad = validate(frame([row("2024-03-11", open=100.0, high=99.5,
+                                    low=99.0, close=99.0)]))
+
+    assert reasons_on(bad, "2024-03-11") == {"high_lt_open"}
+    assert dates_in(good) == {"2024-03-11"}      # 照樣寫進 prices
 
 
 def test_high_lower_than_close_is_rejected():
-    bad = validate(frame([row("2024-03-11", high=99.5, open=99.0, close=100.0, low=99.0)]))[1]
+    """close 對不上就是致命的——回測算報酬用的就是 close，不能信的話整列都不能用"""
+    good, bad = validate(frame([row("2024-03-11", high=99.5, open=99.0, close=100.0, low=99.0)]))
 
     assert "high_lt_close" in reasons_on(bad, "2024-03-11")
+    assert good.empty
 
 
-def test_low_higher_than_open_is_rejected():
-    bad = validate(frame([row("2024-03-11", low=100.5, open=100.0, high=101.0)]))[1]
+def test_low_higher_than_open_is_flagged_but_kept():
+    """同上：低價高於開盤價也只標記"""
+    good, bad = validate(frame([row("2024-03-11", open=100.0, high=101.0,
+                                    low=100.5, close=101.0)]))
 
-    assert "low_gt_open" in reasons_on(bad, "2024-03-11")
+    assert reasons_on(bad, "2024-03-11") == {"low_gt_open"}
+    assert dates_in(good) == {"2024-03-11"}
 
 
 def test_low_higher_than_close_is_rejected():
-    bad = validate(frame([row("2024-03-11", low=100.5, open=101.0, close=100.0, high=101.0)]))[1]
+    good, bad = validate(frame([row("2024-03-11", low=100.5, open=101.0, close=100.0, high=101.0)]))
 
     assert "low_gt_close" in reasons_on(bad, "2024-03-11")
+    assert good.empty
 
 
 def test_non_positive_price_is_rejected():

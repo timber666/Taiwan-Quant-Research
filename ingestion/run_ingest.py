@@ -36,7 +36,10 @@ from database.connection import get_connection
 
 from .cleaner import clean
 from .downloader import has_possible_trading_day, plan_downloads, sync_stock_list
-from .loader import quarantine, update_ingest_log, upsert_dividends, upsert_prices
+from .loader import (
+    quarantine, update_ingest_log, upsert_corporate_actions,
+    upsert_dividends, upsert_prices,
+)
 from .sources.base import PriceSource, RateLimitError
 from .sources.finmind_source import FinMindSource
 from .validator import validate
@@ -51,6 +54,7 @@ class RunSummary:
     updated: int = 0                            # prices 更新列數
     quarantined: int = 0                        # 隔離筆數（一列違反 N 條規則算 N 筆）
     dividends: int = 0                          # dividend_events 新增筆數
+    actions: int = 0                            # corporate_actions 新增筆數
     empty: list = field(default_factory=list)   # 呼叫成功但沒有資料
     skipped: list = field(default_factory=list) # 沒打 API（沒有新資料要抓）
     inactive: list = field(default_factory=list)# 已下市，不再嘗試
@@ -92,15 +96,19 @@ def ingest_one(conn, source: PriceSource, stock_id: str, start: str, end: str, s
     下次增量更新就會重抓那一段。
     """
     dividends = source.fetch_dividends(stock_id, start, end)
+    actions = source.fetch_corporate_actions(stock_id, start, end)
     prices = source.fetch_prices(stock_id, start, end)
 
     if prices.empty:
         summary.empty.append(stock_id)
 
-    ex_dates = set(dividends["ex_date"]) if not dividends.empty else None
+    # 「已知會跳空」的日子：除權息 + 減資 / 面額變更。兩者都不是真的漲跌，
+    # 標記出來只會把 quarantine 洗版，讓真正需要人判斷的異常被埋掉。
+    known_gaps = set(dividends["ex_date"]) | set(actions["ex_date"])
 
     div_result = upsert_dividends(conn, stock_id, dividends)
-    good, bad = validate(clean(prices, stock_id), ex_dates=ex_dates)
+    action_result = upsert_corporate_actions(conn, stock_id, actions)
+    good, bad = validate(clean(prices, stock_id), ex_dates=known_gaps)
     price_result = upsert_prices(conn, good)
     quarantined = quarantine(conn, bad)
     update_ingest_log(conn, stock_id)
@@ -110,6 +118,7 @@ def ingest_one(conn, source: PriceSource, stock_id: str, start: str, end: str, s
     summary.inserted += price_result.inserted
     summary.updated += price_result.updated
     summary.dividends += div_result.inserted
+    summary.actions += action_result.inserted
     summary.quarantined += quarantined
 
 
@@ -124,7 +133,8 @@ def print_summary(conn, summary: RunSummary):
 
     print(f"處理 {summary.processed} 檔："
           f"prices 新增 {summary.inserted} 列 / 更新 {summary.updated} 列，"
-          f"除權息新增 {summary.dividends} 筆，隔離 {summary.quarantined} 筆")
+          f"除權息新增 {summary.dividends} 筆，公司行動新增 {summary.actions} 筆，"
+          f"隔離 {summary.quarantined} 筆")
 
     for label, items in [
         ("沒有新資料（略過，未打 API）", summary.skipped),
@@ -146,7 +156,9 @@ def print_summary(conn, summary: RunSummary):
     ).fetchone()
     print(f"資料庫現況: prices {rows} 列，涵蓋 {stocks} 檔，日期 {first} ~ {last}")
     print(f"            dividend_events "
-          f"{conn.execute('SELECT COUNT(*) FROM dividend_events').fetchone()[0]} 筆")
+          f"{conn.execute('SELECT COUNT(*) FROM dividend_events').fetchone()[0]} 筆，"
+          f"corporate_actions "
+          f"{conn.execute('SELECT COUNT(*) FROM corporate_actions').fetchone()[0]} 筆")
 
     reasons = conn.execute(
         "SELECT reason, COUNT(*) FROM data_quarantine GROUP BY reason ORDER BY COUNT(*) DESC"
@@ -158,8 +170,12 @@ def print_summary(conn, summary: RunSummary):
     print("=" * 60)
 
 
-def run(mode: str = UNIVERSE_MODE, only: str | None = None, source: PriceSource | None = None):
+def run(mode: str = UNIVERSE_MODE, only: str | None = None,
+        full: bool = False, source: PriceSource | None = None):
     """跑一次完整的 ingest，回傳 RunSummary。
+
+    full=True 會忽略 ingest_log、整段歷史重抓，用在「清洗或驗證規則改了，
+    需要讓新規則重新套用到舊資料」的時候。
 
     source 可以注入，測試才不用真的連網。
     """
@@ -177,6 +193,11 @@ def run(mode: str = UNIVERSE_MODE, only: str | None = None, source: PriceSource 
     summary.inactive = [s for s in universe if s not in tradable]
 
     plan = plan_downloads(conn, tradable)
+    if full:
+        # 忽略 ingest_log，整段歷史重抓。改了 cleaner/validator 的規則之後，
+        # 舊資料是用舊規則產生的，不重跑就沒辦法讓新規則套用到歷史。
+        today = plan[next(iter(plan))][1] if plan else None
+        plan = {s: (HISTORY_START_DATE, today) for s in plan}
 
     for stock_id, (start, end) in tqdm(plan.items(), desc="抓取與寫入"):
         if start > end or not has_possible_trading_day(start, end):
@@ -208,9 +229,11 @@ def main(argv=None) -> int:
                         help="sample = config.settings.SAMPLE_UNIVERSE，all = 全市場")
     parser.add_argument("--stock", metavar="STOCK_ID",
                         help="只跑單一股票，方便除錯（會忽略 --mode）")
+    parser.add_argument("--full", action="store_true",
+                        help="忽略 ingest_log，整段歷史重抓（清洗/驗證規則改了時用）")
     args = parser.parse_args(argv)
 
-    summary = run(mode=args.mode, only=args.stock)
+    summary = run(mode=args.mode, only=args.stock, full=args.full)
 
     # 額度用完是「這次沒跑完」，用非零 exit code 表示，之後排程才判斷得出來。
     # 個別股票失敗不算——那在正常運作下本來就會偶爾發生。
