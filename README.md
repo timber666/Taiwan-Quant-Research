@@ -36,14 +36,43 @@ Web Dashboard
 ## 目前進度
 
 - [x] Phase 0：專案設計與環境建立
-- [ ] Phase 1：建立金融資料基礎設施
+- [ ] Phase 1：建立金融資料基礎設施 — 階段 A〜D 完成，進行中
 - [ ] Phase 2：Backtesting Engine
 - [ ] Phase 3：Factor Research
 - [ ] Phase 4：Machine Learning
 - [ ] Phase 5：Portfolio + Risk Management
 - [ ] Phase 6：Productization
 
-目前狀態：**Phase 0 完成**，準備進入 **Phase 1：建立金融資料基礎設施**。
+目前狀態：**Phase 1 進行中**。資料管線
+（`Source → Downloader → Cleaner → Validator → Loader → SQLite`）已經可以跑，
+sample universe 38 檔、2015 年至今約 10.5 萬列日線已灌進資料庫。
+下一步是階段 E：資料存取層（還原股價在這層即時計算）與資料品質 EDA。
+細部規劃見 [`docs/phase1_plan.md`](docs/phase1_plan.md)。
+
+## Data Pipeline
+
+```
+FinMind API
+    ↓  ingestion/sources/      各資料來源的實作，只負責如實回報原始資料
+    ↓  ingestion/downloader.py 決定抓誰、抓哪段（增量更新）
+    ↓  ingestion/cleaner.py    格式：型別、日期寫法、去重、欄位順序
+    ↓  ingestion/validator.py  內容：分成「可用」與「要人看一眼」兩份
+    ↓  ingestion/loader.py     UPSERT 進資料庫，整檔一個交易
+SQLite (database/quant.db)
+    ↓  database/data_access.py 讀取時才計算還原股價（階段 E）
+研究與回測
+```
+
+執行方式：
+
+```bash
+python -m ingestion.run_ingest --mode sample
+```
+
+**還原股價（adj_close）不存在資料庫裡**，`prices` 只存原始成交價，
+除權息與減資事件分別存在 `dividend_events` 與 `corporate_actions`。
+理由是後還原的調整因子會隨著新事件改變，存下來的值在增量更新下必定過期；
+詳見 [`database/schema.sql`](database/schema.sql) 裡 `prices` 的註解。
 
 ## Project Structure
 
@@ -79,4 +108,4 @@ python -m venv .venv
 
 # 安裝套件
 pip install -r requirements.txt
-```
+```

@@ -365,12 +365,24 @@
 - **怎麼做**：寫 `validate(df, ex_dates=None) -> tuple[good_df, bad_df]`，
   `bad_df` 附 `reason`。規則：
   - `high >= low`、`high >= open`、`high >= close`、`low <= open`、`low <= close`
-  - `open/high/low/close > 0`
+  - `high/low/close > 0` → 致命；`open > 0` **只標記不隔離**（`non_positive_open`）
   - `volume >= 0`
   - `date` 不重複
   - 單日 `close` 相對前一日漲跌幅 `abs > 0.15` → 標記 `reason="price_jump"`
     （**標記但不隔離**，因為可能是真的，例如減資）
-  - 前四類違規 → 進 `bad_df`
+  - 致命類違規 → 進 `bad_df` 且不寫進 `prices`；標記類照樣寫進 `prices`
+- **為什麼 `open` 要跟其他三個價格分開**：上市首日與停牌復牌當天沒有開盤參考價，
+  FinMind 會填 0，但那天是真的有成交的。實測有三天因此被整列丟掉：
+  6861 睿生光電 2021-11-30（上市首日，成交 41 萬股）、6919 康霈 2022-12-26
+  （上市首日，767 萬股）與 2024-03-29（停牌 12 天後復牌，142 萬股）——
+  三天的 `high/low/close/volume` 全部正常，只有 `open` 是 0。
+  這跟 `high_lt_open` / `low_gt_open` 之所以只標記不隔離是同一個理由：
+  回測用的是 `close`，為了一個不可靠的 `open` 在序列中間開一個洞並不划算。
+- **`price_jump` 要排除當日 `close <= 0` 的列**：無成交日的 `close` 是 0，
+  「昨天 39 元、今天 0 元」會被算成 -100% 的跳空，但那不是價格異常、
+  而且那一列已經被 `non_positive_price` 擋掉了。實測 44 筆 `price_jump` 裡
+  有 36 筆是這樣來的假訊號，真正需要人判斷的只有 8 筆——`data_quarantine`
+  的定位是「人應該看一眼的東西」，被 82% 的雜訊稀釋掉就失去意義了。
 - **為什麼多一個 `ex_dates` 參數**：`price_jump` 是拿**原始價**算的，而除權息當天
   原始價本來就會跳空。6669 緯穎 2026-09-02 是 7800 → 2610（-66%），
   2409 友達每年除息也都會觸發。不排除的話，quarantine 報表會被除權息洗版，
@@ -387,7 +399,7 @@
 
 ## 步驟 22：`ingestion/loader.py` + 冪等測試 `tests/test_loader.py`
 
-- **怎麼做**：四個函式
+- **怎麼做**：五個函式
   - `upsert_prices(conn, good_df)`：
     `INSERT INTO prices (...) VALUES (...) ON CONFLICT(stock_id, date) DO UPDATE SET ...`
   - `upsert_dividends(conn, stock_id, div_df)`：寫進 `dividend_events`，
@@ -395,6 +407,9 @@
     **這是新增的、也是整個階段 D 最關鍵的一步** —— 這張表從階段 B 建好到現在
     一直是空的，而步驟 24 讀取時要還原股價，唯一的資料來源就是它。
     沒有這一步，步驟 24 無米可炊。
+  - `upsert_corporate_actions(conn, stock_id, action_df)`：寫進 `corporate_actions`，
+    `ON CONFLICT(stock_id, ex_date, action_type) DO UPDATE`。跟除權息一樣是步驟 24
+    算還原價的輸入，兩張表分開的理由見 `database/schema.sql`。
   - `quarantine(conn, bad_df)`：寫進 `data_quarantine`（`raw_json` 存整列的 JSON），
     用步驟 16 加的主鍵做 `ON CONFLICT(stock_id, date, reason) DO UPDATE`，
     重跑不會疊加。
@@ -414,11 +429,13 @@
   → sync_stock_list
   → plan_downloads
   → for each stock:
-        fetch_dividends  → upsert_dividends        （先做，validate 需要 ex_dates）
+        fetch_dividends         → upsert_dividends          ┐ 先做，兩者的日期
+        fetch_corporate_actions → upsert_corporate_actions  ┘ 合起來就是 ex_dates
         fetch_prices     → clean
                          → validate(df, ex_dates)
                          → upsert_prices + quarantine
                          → update_ingest_log
+                         → commit（整檔一個交易，失敗就整檔 rollback）
   → 印出摘要: 新增 X 列 / 更新 Y 列 / 隔離 Z 列 / 除權息事件 E 筆 / 涵蓋 N 檔 / 日期範圍 ...
   ```
   加 `argparse`：`--mode sample|all`、`--stock 2330`（只跑單檔，方便除錯）。
@@ -525,7 +542,7 @@
 - [ ] `database/init_db.py`：只建表、冪等、走 settings 路徑
 - [ ] `ingestion/`：base、finmind_source、adjustment、downloader、cleaner、validator、
       loader、run_ingest
-- [ ] `tests/`：adjustment、cleaner、validator、loader、data_access 測試全綠
+- [ ] `tests/`：adjustment、cleaner、validator、loader、run_ingest、data_access 測試全綠
 - [ ] `database/data_access.py`：get_prices / get_universe / get_price_matrix
       （還原價在這層即時計算）
 - [ ] `notebooks/02_data_quality_eda.ipynb` 跑得動
