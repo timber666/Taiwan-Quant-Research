@@ -21,7 +21,7 @@
 - [x] 階段 B：資料庫 Schema 重設計（步驟 7〜10）
 - [x] 階段 C：Downloader（步驟 11〜15）
 - [x] 階段 D：Cleaner + Validator + Loader（步驟 16〜23）
-- [ ] 階段 E：資料存取層 + EDA + 驗收（步驟 24〜30）
+- [x] 階段 E：資料存取層 + EDA + 驗收（步驟 24〜30，步驟 29 略過）
 
 > 建議每完成 1〜2 步就 `git commit` 一次，訊息像
 > `Phase 1 (step 7): redesign database schema`。
@@ -517,11 +517,19 @@
   - 更新 `docs/journal.md`：Phase 1 做了什麼、卡關與解法、下一步（Phase 2 回測引擎）。
 - **完成標準**：陌生人讀 docs 就能看懂資料怎麼進來、資料庫長什麼樣。
 
-## 步驟 29：擴大到全市場（可選，行有餘力）
+## 步驟 29：擴大到全市場（可選）— **略過，理由如下**
 
 - **怎麼做**：`UNIVERSE_MODE = "all"`，`run_ingest.py --mode all` 跑一次。
   觀察 API 額度、耗時、quarantine 量。若太吃力就留在 sample，並在 journal 記錄原因。
 - **完成標準**：知道全市場跑一次要多久、會遇到什麼問題（就算最後決定先不做）。
+- **實際決定：略過，但完成標準已達成。** 步驟 27 驗證增量更新時量到一件關鍵的事：
+  增量省下的是資料量與資料庫寫入，**不是 API 呼叫次數**——3 個交易日的增量花 49.9 秒，
+  全量 10.5 年花 67 秒，因為不論視窗多短，每檔股票都還是要問同樣幾個問題。
+  換算全市場是 1700 檔 × 3 次 ≈ 5100 次呼叫，遠超免費的 600 次/hr，
+  光網路往返也要 30 分鐘以上。
+  真正的解法是改用 FinMind 的批次查詢（`data_id_list` 一次帶多檔），不是靠增量。
+  硬跑一次撞額度學不到更多，所以留到 Phase 3 因子研究真的需要橫斷面樣本時再做——
+  那時才會真的需要批次查詢。
 
 ## 步驟 30：Phase 1 收尾
 
@@ -535,19 +543,19 @@
 
 ## Phase 1 最終檢查清單
 
-- [ ] `requirements.txt` 正常編碼、含 FinMind
-- [ ] `docs/data_source.md`（來源評估 + 還原股價說明）
-- [ ] `database/schema.sql`：stocks / prices(只存原始價) / dividend_events /
+- [x] `requirements.txt` 正常編碼、含 FinMind
+- [x] `docs/data_source.md`（來源評估 + 還原股價說明）
+- [x] `database/schema.sql`：stocks / prices(只存原始價) / dividend_events /
       corporate_actions / ingest_log / data_quarantine(有主鍵)
-- [ ] `database/init_db.py`：只建表、冪等、走 settings 路徑
-- [ ] `ingestion/`：base、finmind_source、adjustment、downloader、cleaner、validator、
+- [x] `database/init_db.py`：只建表、冪等、走 settings 路徑
+- [x] `ingestion/`：base、finmind_source、adjustment、downloader、cleaner、validator、
       loader、run_ingest
-- [ ] `tests/`：adjustment、cleaner、validator、loader、run_ingest、data_access 測試全綠
-- [ ] `database/data_access.py`：get_prices / get_universe / get_price_matrix
+- [x] `tests/`：adjustment、cleaner、validator、loader、run_ingest、data_access 測試全綠
+- [x] `database/data_access.py`：get_prices / get_universe / get_price_matrix
       （還原價在這層即時計算）
-- [ ] `notebooks/02_data_quality_eda.ipynb` 跑得動
-- [ ] 增量更新驗證過
-- [ ] `docs/data_dictionary.md` + README pipeline 圖 + journal 更新
+- [x] `notebooks/02_data_quality_eda.ipynb` 跑得動
+- [x] 增量更新驗證過
+- [x] `docs/data_dictionary.md` + README pipeline 圖 + journal 更新
 - [ ] PR 合併，README 進度勾 Phase 1
 
 ---

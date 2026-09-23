@@ -36,19 +36,21 @@ Web Dashboard
 ## 目前進度
 
 - [x] Phase 0：專案設計與環境建立
-- [ ] Phase 1：建立金融資料基礎設施 — 階段 A〜E 完成，收尾中
+- [x] Phase 1：建立金融資料基礎設施
 - [ ] Phase 2：Backtesting Engine
 - [ ] Phase 3：Factor Research
 - [ ] Phase 4：Machine Learning
 - [ ] Phase 5：Portfolio + Risk Management
 - [ ] Phase 6：Productization
 
-目前狀態：**Phase 1 收尾中**。整條管線
+目前狀態：**Phase 1 完成**。整條管線
 （`Source → Downloader → Cleaner → Validator → Loader → SQLite → Data Access`）
 已經跑通並通過驗收：sample universe 38 檔、2015 年至今約 10.5 萬列日線，
 增量更新實測正確，資料品質報告見
 [`notebooks/02_data_quality_eda.ipynb`](notebooks/02_data_quality_eda.ipynb)。
 細部規劃見 [`docs/phase1_plan.md`](docs/phase1_plan.md)。
+
+下一步是 Phase 2：回測引擎。
 
 ## Data Pipeline
 
