@@ -72,8 +72,12 @@ def _as_bool(mask: pd.Series) -> pd.Series:
     return mask.fillna(False).astype(bool)
 
 
-def _price_jump_mask(df: pd.DataFrame, ex_dates: set) -> pd.Series:
+def _price_jump_mask(df: pd.DataFrame, ex_dates: set, prev_close=None) -> pd.Series:
     """標出單日漲跌幅過大的列，但跳過除權息日。
+
+    prev_close 是「這批資料第一列的前一個交易日」的收盤價。沒有它，第一列就沒有
+    比較對象——而每天跑的增量更新，視窗通常只有一天，等於這條規則永遠不會觸發。
+    run_ingest 會從 prices 裡把它查出來傳進來。
 
     除權息當天的原始價本來就會跳空——6669 緯穎 2026-09-02 從 7800 掉到 2610
     （-66%）、2409 友達每年除息也都會觸發。那些不是資料有問題，是市場的正常行為。
@@ -87,9 +91,12 @@ def _price_jump_mask(df: pd.DataFrame, ex_dates: set) -> pd.Series:
     以及尚未納入的其他公司行動。
     """
     ordered = df.sort_values("date")
-    prev_close = ordered["close"].shift(1)
+    prev = ordered["close"].shift(1)
+    if prev_close is not None:
+        prev.iloc[0] = prev_close
 
-    # prev_close 為 0 或缺值時不計算，否則會得到 inf。第一列沒有前一日，同樣跳過。
+    # 前一日收盤為 0 或缺值時不計算，否則會得到 inf。第一列沒有前一日（也沒有傳
+    # prev_close）時同樣跳過。
     #
     # 當日 close 為 0 也要排除。無成交日的 close 是 0，「昨天 39 元、今天 0 元」
     # 會被算成 -100% 的跳空，但那不是價格異常，是那天根本沒有價格——而且那一列
@@ -97,8 +104,8 @@ def _price_jump_mask(df: pd.DataFrame, ex_dates: set) -> pd.Series:
     # 只是把同一個問題記兩遍。實測：44 筆 price_jump 裡有 36 筆是這樣來的假訊號，
     # 真正需要人判斷的只有 8 筆。quarantine 的定位是「人應該看一眼的東西」，
     # 被 82% 的雜訊稀釋掉就失去意義了。
-    comparable = prev_close.notna() & (prev_close > 0) & (ordered["close"] > 0)
-    change = (ordered["close"] - prev_close).abs() / prev_close
+    comparable = prev.notna() & (prev > 0) & (ordered["close"] > 0)
+    change = (ordered["close"] - prev).abs() / prev
     jumped = comparable & (change > PRICE_JUMP_THRESHOLD)
 
     if ex_dates:
@@ -108,7 +115,7 @@ def _price_jump_mask(df: pd.DataFrame, ex_dates: set) -> pd.Series:
     return jumped.reindex(df.index, fill_value=False)
 
 
-def validate(df: pd.DataFrame, ex_dates=None) -> tuple[pd.DataFrame, pd.DataFrame]:
+def validate(df: pd.DataFrame, ex_dates=None, prev_close=None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """檢查清理過的日線，回傳 (good_df, bad_df)。
 
     Args:
@@ -116,6 +123,8 @@ def validate(df: pd.DataFrame, ex_dates=None) -> tuple[pd.DataFrame, pd.DataFram
         ex_dates: 這檔股票「已知會跳空」的日子（"YYYY-MM-DD" 字串的集合），
             包含除權息交易日與減資 / 面額變更日。這些日子不做 price_jump 檢查。
             傳 None 代表不知道，那些跳空就會全部被標記出來。
+        prev_close: df 第一列的前一個交易日收盤價（通常來自資料庫裡已經有的資料）。
+            傳 None 代表沒有前一日，第一列就不做 price_jump 檢查。
 
     Returns:
         (good_df, bad_df)
@@ -176,7 +185,7 @@ def validate(df: pd.DataFrame, ex_dates=None) -> tuple[pd.DataFrame, pd.DataFram
     # 默默挑一筆正是上游出問題的原因。
     checks.append(("duplicate_date", work["date"].duplicated(keep=False), True))
 
-    checks.append(("price_jump", _price_jump_mask(work, ex_dates), False))
+    checks.append(("price_jump", _price_jump_mask(work, ex_dates, prev_close), False))
 
     rejected = pd.Series(False, index=work.index)
     flagged = []

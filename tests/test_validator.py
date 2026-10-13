@@ -277,11 +277,42 @@ def test_jump_exactly_at_the_threshold_is_not_flagged():
 
 
 def test_first_row_has_no_previous_day_to_compare():
-    """一批資料的第一列沒有前一日可比，不該被標記。
-
-    增量更新每次只抓幾天，第一列的前一日在上一批裡——那不是跳空，是視窗邊界。
-    """
+    """沒有傳 prev_close 時，第一列沒有前一日可比，不該被標記（不知道 ≠ 異常）"""
     assert validate(frame([row("2024-03-11", close=100.0)]))[1].empty
+
+
+def test_prev_close_lets_the_first_row_be_checked():
+    """增量更新的視窗通常只有一天，第一列的前一日在資料庫裡。
+
+    舊版只拿視窗內的資料互相比，於是每天跑的增量更新 price_jump 永遠不會觸發——
+    同一個 +50% 的跳空，全量重抓會標記、增量更新不會。prev_close 把資料庫裡的
+    前一日收盤帶進來，兩種跑法的結果才會一致。
+    """
+    df = frame([row("2024-03-12", close=150.0)])
+
+    bad = validate(df, prev_close=100.0)[1]
+
+    assert reasons_on(bad, "2024-03-12") == {"price_jump"}
+
+
+def test_prev_close_still_respects_ex_dates():
+    """有了前一日之後，除權息日照樣豁免——不能因為補了比較對象就把除息跳空標出來"""
+    df = frame([row("2024-03-12", close=70.0)])
+
+    assert validate(df, ex_dates={"2024-03-12"}, prev_close=100.0)[1].empty
+
+
+def test_prev_close_is_compared_with_the_earliest_date_not_the_first_row():
+    """prev_close 是「日期最早那一列」的前一日，不是「排在第一列」的前一日。
+
+    兩天收盤都是 100，前一日 50：只有 03-11 是 +100%。若誤把 prev_close 套在
+    列順序的第一列（03-12），會變成 03-12 被標記、03-11 反而沒事。
+    """
+    df = frame([row("2024-03-12", close=100.0), row("2024-03-11", close=100.0)])
+
+    bad = validate(df, prev_close=50.0)[1]
+
+    assert dates_in(bad) == {"2024-03-11"}
 
 
 def test_zero_previous_close_does_not_blow_up():

@@ -180,8 +180,68 @@ def test_two_events_on_the_same_day_are_combined_into_one_reference_price():
 
 
 # ---------------------------------------------------------------------------
+# 落在休市日的事件（Phase 1 複查時發現的缺陷）
+# ---------------------------------------------------------------------------
+
+def test_event_on_a_market_closure_day_is_applied_to_the_next_trading_day():
+    """2884 玉山金 2024-07-25 除權息，但 07-24、07-25 凱米颱風休市。
+
+    FinMind 記的是原定的 07-25，prices 裡沒有那天，跳空實際發生在 07-26。
+    舊版用日期直接 merge，這筆事件被默默丟掉：07-23 的還原價維持 29.80，
+    07-26 的還原後報酬變成 −9.4%（正確是 −3.7%）。
+
+    還原後 07-23 = (29.80 − 1.2) / (1 + 0.0200332) = 28.04 ≈ 官方 reference_price 28.03。
+    """
+    prices = price_frame([("2024-07-23", 29.80), ("2024-07-26", 27.00)])
+    divs = pd.DataFrame([{"date": "2024-07-25", "cash_div": 1.2, "stock_div": 0.200332}])
+
+    adj = adjusted_close(prices, divs)
+
+    assert adj["2024-07-23"] == pytest.approx(28.03, abs=0.01)
+    assert adj["2024-07-26"] == pytest.approx(27.00)
+
+
+def test_corporate_action_on_a_closure_day_is_applied_to_the_next_trading_day():
+    """減資 / 面額變更走的是另一條路徑（_apply_action_factors），一樣要順延"""
+    actions = pd.DataFrame([{"date": "2024-07-25", "before_price": 100.0, "after_price": 200.0}])
+
+    adj = adjusted_close(price_frame([("2024-07-23", 100.0), ("2024-07-26", 200.0)]),
+                         pd.DataFrame(columns=DIV_COLUMNS), actions)
+
+    assert adj["2024-07-23"] == pytest.approx(200.0)
+
+
+def test_event_after_the_last_trading_day_changes_nothing():
+    """事件晚於最後一個交易日（例如今天除息、收盤資料還沒抓進來）：
+
+    它之後還沒有任何價格，不影響任何一段已觀測到的報酬。不能因為順延找不到
+    交易日就出錯，也不能把它硬套到最後一天、讓「最新一天不動」的定義被破壞。
+    """
+    prices = price_frame([("2024-07-22", 100.0), ("2024-07-23", 100.0)])
+    divs = pd.DataFrame([{"date": "2024-07-25", "cash_div": 10.0, "stock_div": 0.0}])
+
+    adj = adjusted_close(prices, divs)
+
+    assert list(adj) == [pytest.approx(100.0), pytest.approx(100.0)]
+
+
+# ---------------------------------------------------------------------------
 # 既有行為：重構時不要弄壞
 # ---------------------------------------------------------------------------
+
+def test_adjusted_prices_are_not_rounded():
+    """還原價是算報酬用的中間值，不能先四捨五入。
+
+    舊版 round(2)：低價股還原到個位數之後，誤差直接變成報酬誤差
+    （實測 2609 陽明單日報酬最大偏差 0.33%）。這裡 3.00 × (3.00 / 3.10) = 2.9032...，
+    round(2) 會變成 2.90，差 0.11%。
+    """
+    prices = price_frame([("2024-03-11", 3.00), ("2024-03-12", 3.10), ("2024-03-13", 3.00)])
+    divs = pd.DataFrame([{"date": "2024-03-13", "cash_div": 0.10, "stock_div": 0.0}])
+
+    adj = adjusted_close(prices, divs)
+
+    assert adj["2024-03-11"] == pytest.approx(3.00 * 3.00 / 3.10, rel=1e-12)
 
 def test_multiple_events_are_compounded():
     """多次事件的調整係數要累乘，不是只套用最近的那一次。

@@ -88,6 +88,20 @@ def active_members(conn, universe: list[str]) -> list[str]:
     return [s for s in universe if s in active]
 
 
+def last_close_before(conn, stock_id: str, day: str) -> float | None:
+    """prices 裡這檔股票在 day 之前的最後一筆收盤價，沒有的話回傳 None。
+
+    給 validate 當作這批資料第一列的「前一日」。增量更新的視窗通常只有一天，
+    不從資料庫補這個值的話，price_jump 永遠找不到比較對象。
+    prices 只收 validator 放行的列，所以這裡拿到的一定是可用的價格（不會是 0）。
+    """
+    row = conn.execute(
+        "SELECT close FROM prices WHERE stock_id = ? AND date < ? ORDER BY date DESC LIMIT 1",
+        (stock_id, day),
+    ).fetchone()
+    return row[0] if row else None
+
+
 def ingest_one(conn, source: PriceSource, stock_id: str, start: str, end: str, summary: RunSummary):
     """處理單一股票：抓 -> 清 -> 驗 -> 寫，最後 commit。
 
@@ -108,7 +122,10 @@ def ingest_one(conn, source: PriceSource, stock_id: str, start: str, end: str, s
 
     div_result = upsert_dividends(conn, stock_id, dividends)
     action_result = upsert_corporate_actions(conn, stock_id, actions)
-    good, bad = validate(clean(prices, stock_id), ex_dates=known_gaps)
+    cleaned = clean(prices, stock_id)
+    # 以清理後實際的第一天為準，而不是 start：要的是「緊接在這批資料之前」的那一天
+    prev_close = last_close_before(conn, stock_id, cleaned["date"].min()) if len(cleaned) else None
+    good, bad = validate(cleaned, ex_dates=known_gaps, prev_close=prev_close)
     price_result = upsert_prices(conn, good)
     quarantined = quarantine(conn, bad)
     update_ingest_log(conn, stock_id)

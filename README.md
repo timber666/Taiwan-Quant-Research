@@ -108,7 +108,7 @@ mat = get_price_matrix(field="adj_close")  # index=date, columns=stock_id
 
 | 文件 | 內容 |
 |---|---|
-| [`docs/data_source.md`](docs/data_source.md) | 資料來源選型比較、已知限制、踩過的四個坑 |
+| [`docs/data_source.md`](docs/data_source.md) | 資料來源選型比較、已知限制、踩過的五個坑 |
 | [`docs/data_dictionary.md`](docs/data_dictionary.md) | 六張表每個欄位的意義、單位、範例值 |
 | [`docs/phase1_plan.md`](docs/phase1_plan.md) | Phase 1 的逐步執行規劃 |
 | [`docs/journal.md`](docs/journal.md) | 開發日誌：做了什麼、卡在哪、怎麼解 |

@@ -8,7 +8,33 @@
 （只要有原始 OHLC + 除權息事件就能算），之後如果加了其他資料來源，一樣可以共用。
 """
 
+import numpy as np
 import pandas as pd
+
+
+def _align_to_trading_days(event_dates: pd.Series, trading_days: pd.Series) -> pd.Series:
+    """把事件日對齊到「當天或之後的第一個交易日」。
+
+    資料來源記的是**原定**的除權息日。那天如果剛好休市（例如颱風假），跳空會發生在
+    下一個交易日，但 prices 裡根本沒有原定那天的列——直接用日期 merge 的話，
+    事件會被默默丟掉。實測 2884 玉山金 2024-07-25（凱米颱風休市）就是這樣：
+    1.2 元現金 + 0.2 元股票股利整筆沒被還原，07-26 的還原後報酬從 −3.7% 變成 −9.4%。
+    2886 兆豐金 2019-08-09（利奇馬颱風）、6442 光聖 2024-07-25 同理。
+
+    晚於最後一個交易日的事件回傳 NaT：它之後還沒有任何價格（例如今天除息、
+    但今天的收盤還沒抓進來），不影響任何一段已觀測到的報酬，呼叫端直接丟掉即可。
+
+    Args:
+        event_dates: 事件日（datetime）
+        trading_days: 升冪排序的交易日（datetime）
+    """
+    days = trading_days.to_numpy()
+    pos = np.searchsorted(days, event_dates.to_numpy(), side="left")
+    inside = pos < len(days)
+
+    aligned = np.full(len(pos), np.datetime64("NaT"), dtype=days.dtype)
+    aligned[inside] = days[pos[inside]]
+    return pd.Series(aligned, index=event_dates.index)
 
 
 def calculate_adjusted_price(
@@ -21,8 +47,9 @@ def calculate_adjusted_price(
         df_div: 至少要有 date（除權息交易日）, cash_div（現金股利/每股）,
             stock_div（股票股利/每 10 股配股數）欄位。
             同一天出現多筆事件會自動加總，呼叫端不必自己先合併。
+            落在非交易日（例如颱風休市）的事件會順延到下一個交易日。
         df_actions: 減資與面額變更事件，要有 date, before_price, after_price 欄位。
-            可以是 None 或空表（多數股票本來就沒有）。
+            可以是 None 或空表（多數股票本來就沒有）。日期的處理方式同上。
 
     Returns:
         df_price 加上 adj_open/adj_high/adj_low/adj_close 欄位的 DataFrame，
@@ -46,9 +73,10 @@ def calculate_adjusted_price(
     df = df.sort_values("date").reset_index(drop=True)
 
     div = df_div[["date", "cash_div", "stock_div"]].copy()
-    div["date"] = pd.to_datetime(div["date"])
-    # 同一天可能有多筆事件（例如現金與股票分開公告）。不先合併就 merge 的話，
-    # 一天有幾筆事件、那天的價格列就會被複製幾份，而且每一筆各自去算調整因子時，
+    div["date"] = _align_to_trading_days(pd.to_datetime(div["date"]), df["date"])
+    div = div.dropna(subset=["date"])
+    # 同一天可能有多筆事件（例如現金與股票分開公告，或順延後跟下一個交易日的事件撞在一起）。
+    # 不先合併就 merge 的話，一天有幾筆事件、那天的價格列就會被複製幾份，而且每一筆各自去算調整因子時，
     # 第二筆拿到的 prev_close 會是「同一天自己的收盤價」而不是真正的前一日收盤價，
     # 算出來的還原價是錯的（實測：200 -> 95.0，正確應為 97.5）。
     # 相加是正確的合併方式：證交所公式 P_ref = (P_prev − D) / (1 + S) 本來就同時
@@ -76,8 +104,11 @@ def calculate_adjusted_price(
     shifted = df["adj_factor"].shift(-1).fillna(1.0)
     df["cum_factor"] = shifted.iloc[::-1].cumprod().iloc[::-1]
 
+    # 刻意不四捨五入。還原價是拿來算報酬的中間值，不是給人看的報價：低價股被還原到
+    # 個位數之後，round(2) 的誤差會直接變成報酬誤差——實測 2609 陽明最低還原到 2.24 元，
+    # 單日報酬最大偏差 0.33%，有 344 天超過 0.1%。要顯示時再自己格式化。
     for col in ["open", "high", "low", "close"]:
-        df[f"adj_{col}"] = (df[col] * df["cum_factor"]).round(2)
+        df[f"adj_{col}"] = df[col] * df["cum_factor"]
 
     return df.drop(columns=["cash_div", "stock_div", "prev_close", "split_ratio", "adj_factor", "cum_factor"])
 
@@ -93,8 +124,8 @@ def _apply_action_factors(df: pd.DataFrame, df_actions: pd.DataFrame) -> pd.Data
         return df
 
     act = df_actions[["date", "before_price", "after_price"]].copy()
-    act["date"] = pd.to_datetime(act["date"])
-    act = act[act["before_price"] > 0]
+    act["date"] = _align_to_trading_days(pd.to_datetime(act["date"]), df["date"])
+    act = act[act["date"].notna() & (act["before_price"] > 0)]
     if act.empty:
         return df
 

@@ -215,6 +215,26 @@ def test_unexplained_gap_is_still_quarantined(db):
     assert rows(db, "SELECT COUNT(*) FROM data_quarantine WHERE reason='price_jump'") == [(1,)]
 
 
+def test_incremental_run_catches_a_jump_at_the_window_boundary(db):
+    """增量更新抓到的第一天，要跟資料庫裡的前一日比，不是只跟視窗內的前一列比。
+
+    第二次跑只抓到 03-20 這一天，100 -> 70 的跳空只有拿資料庫裡 03-19 的收盤才看得到。
+    舊版在這種情況永遠不會標記——而每天跑的增量更新，視窗通常就只有一天。
+    """
+    first = FakeSource(
+        ["1111"],
+        price_map={"1111": prices(("2024-03-18", 100.0), ("2024-03-19", 100.0))},
+    )
+    run_ingest.run(only="1111", source=first)
+
+    second = FakeSource(["1111"], price_map={"1111": prices(("2024-03-20", 70.0))})
+    run_ingest.run(only="1111", source=second)
+
+    assert rows(db, "SELECT date FROM data_quarantine WHERE reason='price_jump'") == [
+        ("2024-03-20",)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # 失敗的處置
 # ---------------------------------------------------------------------------
