@@ -1,5 +1,10 @@
 # Taiwan Quant Research Platform
 
+> **本專案已停止開發（2026-11-02），研究在 [stock-screener](https://github.com/timber666/stock-screener) 延續。**
+> 本專案完成到 Phase 1（資料基礎建設）；其中驗證過的還原權息計算與測試案例已移植到 stock-screener，
+> 後續的因子研究、組合回測等規劃見該專案的 [RESEARCH_PLAN.md](https://github.com/timber666/stock-screener/blob/main/RESEARCH_PLAN.md)。
+> 本 repo 保留作為參考，不再更新。
+
 台股量化研究與回測平台
 
 ## Project Goal
